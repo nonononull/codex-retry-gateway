@@ -1198,6 +1198,42 @@ function reasoningMatched(config, reasoning) {
   return reasoning !== null && config.reasoning_equals.includes(reasoning);
 }
 
+function isExpectedStreamTermination(error) {
+  if (!error) {
+    return false;
+  }
+  if (error.name === "AbortError") {
+    return true;
+  }
+  return error instanceof TypeError && error.message === "terminated";
+}
+
+function isRetryableUpstreamFetchError(error) {
+  if (!error) {
+    return false;
+  }
+  return error instanceof TypeError && error.message === "fetch failed";
+}
+
+async function fetchUpstreamWithRetry(upstreamUrl, init, logger) {
+  const maxAttempts = 2;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await fetch(upstreamUrl, init);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableUpstreamFetchError(error) || attempt === maxAttempts) {
+        break;
+      }
+      logger?.(`[retry] upstream fetch failed attempt=${attempt} url=${upstreamUrl}`);
+    }
+  }
+
+  throw lastError;
+}
+
 function inspectSseChunk(state, chunk) {
   const decoded = state.decoder.decode(chunk, { stream: true });
   state.buffer += decoded;
@@ -1292,7 +1328,19 @@ async function handleStreaming({
   let wroteAnyChunk = false;
   let observedReasoning = null;
   while (true) {
-    const { done, value } = await reader.read();
+    let readResult;
+    try {
+      readResult = await reader.read();
+    } catch (error) {
+      if (isExpectedStreamTermination(error)) {
+        recordInspectedResponse(monitor, observedReasoning, false);
+        res.end();
+        return;
+      }
+      throw error;
+    }
+
+    const { done, value } = readResult;
     if (done) {
       recordInspectedResponse(monitor, observedReasoning, false);
       res.end();
@@ -1367,12 +1415,12 @@ async function proxyRequest(runtime, req, res) {
   const upstreamUrl = buildUpstreamUrl(config.upstream_base_url, incomingUrl);
   const abortController = new AbortController();
 
-  const upstreamResponse = await fetch(upstreamUrl, {
+  const upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, {
     method: req.method,
     headers: cloneHeadersForUpstream(req.headers),
     body: requestBody.length > 0 ? requestBody : undefined,
     signal: abortController.signal,
-  });
+  }, logger);
 
   const shouldInspect = matchPath(config, pathname);
   const responseIsStream =
