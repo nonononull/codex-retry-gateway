@@ -7,7 +7,7 @@
 - 保持 Codex 继续使用现有 `auth.json`
 - 只把 `config.toml` 的当前 provider `base_url` 改成本地网关
 - 非流式命中 `reasoning_tokens = 516` 时返回 `502`
-- 流式命中时直接断开连接，让 Codex 自行重试
+- 流式命中时默认先缓存并判断；一旦命中 `516`，统一返回 `502`
 - 默认同时拦截 root 路径和 `/v1` 路径：
   - `/responses`
   - `/chat/completions`
@@ -191,7 +191,9 @@ macOS / Linux: ~/.codex-retry-gateway/config/config.json
 - `non_stream_status_code`
   - 默认 `502`
 - `stream_action`
-  - 默认 `disconnect`
+  - 默认 `strict_502`
+  - `strict_502`：先缓存整个流，命中 `516` 时统一返回 `502`
+  - `disconnect`：兼容旧行为；若命中发生在已透传 chunk 之后，则直接断开连接
 - `log_match`
   - 是否记录命中日志
 

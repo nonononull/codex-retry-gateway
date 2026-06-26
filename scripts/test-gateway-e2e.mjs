@@ -4,7 +4,7 @@ import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -63,7 +63,25 @@ function createSseResponse(res, chunks) {
   });
 }
 
+function createTerminatedSseResponse(res, chunks, destroyDelayMs = 20) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+    "x-upstream-test": "sse-terminated",
+  });
+
+  for (const chunk of chunks) {
+    res.write(chunk);
+  }
+
+  setTimeout(() => {
+    res.socket?.destroy();
+  }, destroyDelayMs);
+}
+
 function startFakeUpstream(port) {
+  const failBeforeResponseCounts = new Map();
   const server = http.createServer((req, res) => {
     const responsePaths = new Set(["/responses", "/v1/responses"]);
     const chatCompletionPaths = new Set(["/chat/completions", "/v1/chat/completions"]);
@@ -90,11 +108,37 @@ function startFakeUpstream(port) {
       req.on("end", () => {
         const parsed = JSON.parse(body || "{}");
         const reasoning = parsed.test_reasoning_tokens ?? 128;
+        if (parsed.test_fail_before_response_once) {
+          const failKey = `${req.url}:fail-before-response-once`;
+          const failCount = (failBeforeResponseCounts.get(failKey) || 0) + 1;
+          failBeforeResponseCounts.set(failKey, failCount);
+          if (failCount === 1) {
+            res.socket?.destroy();
+            return;
+          }
+        }
+        if (parsed.test_force_terminate) {
+          createTerminatedSseResponse(res, [
+            'data: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+          ]);
+          return;
+        }
+        if (parsed.stream) {
+          createSseResponse(res, [
+            'data: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+            `data: {"response":{"usage":{"output_tokens_details":{"reasoning_tokens":${reasoning}}}}}\n\n`,
+            "data: [DONE]\n\n",
+          ]);
+          return;
+        }
         createJsonResponse(
           res,
           200,
           {
             id: "resp_test",
+            retry_attempt: parsed.test_fail_before_response_once
+              ? failBeforeResponseCounts.get(`${req.url}:fail-before-response-once`) || 0
+              : 0,
             usage: {
               output_tokens_details: {
                 reasoning_tokens: reasoning,
@@ -232,7 +276,7 @@ async function run() {
     endpoints: ["/responses", "/chat/completions", "/v1/responses", "/v1/chat/completions"],
     reasoning_equals: [516],
     non_stream_status_code: 502,
-    stream_action: "disconnect",
+    stream_action: "strict_502",
     log_match: true,
     health_path: "/__codex_retry_gateway/health",
   };
@@ -279,17 +323,32 @@ async function run() {
       );
     }
 
-    for (const streamPath of ["/chat/completions", "/v1/chat/completions"]) {
+    const recoveredResponse = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ test_fail_before_response_once: true }),
+    });
+    const recoveredBody = await recoveredResponse.json();
+    assert(recoveredResponse.status === 200, `首次 fetch failed 后未自动恢复: ${recoveredResponse.status}`);
+    assert(recoveredBody?.retry_attempt === 2, "首次 fetch failed 后未命中第二次上游请求");
+
+    for (const streamPath of [
+      "/responses",
+      "/v1/responses",
+      "/chat/completions",
+      "/v1/chat/completions",
+    ]) {
       const blockedStream = await readSseUntilClose(
         `http://127.0.0.1:${gatewayPort}${streamPath}`,
         { stream: true, test_reasoning_tokens: 516 },
       );
-      assert(blockedStream.status === 200, `${streamPath} 516 首状态异常: ${blockedStream.status}`);
-      assert(blockedStream.text.includes('"content":"hello"'), `${streamPath} 流式 516 未先透传正常 chunk`);
-      assert(!blockedStream.text.includes("[DONE]"), `${streamPath} 流式 516 不应完整结束`);
+      assert(blockedStream.status === 502, `${streamPath} 516 未返回 502: ${blockedStream.status}`);
+      assert(!blockedStream.text.includes("hello"), `${streamPath} 严格 502 模式不应先透传正常 chunk`);
+      assert(!blockedStream.text.includes("[DONE]"), `${streamPath} 严格 502 模式不应回放 DONE`);
+      const blockedStreamBody = JSON.parse(blockedStream.text);
       assert(
-        blockedStream.closedByError || blockedStream.text.includes("[[reader-error:"),
-        `${streamPath} 流式 516 未表现为中途断开`,
+        blockedStreamBody?.error?.code === "reasoning_guard_triggered",
+        `${streamPath} 流式 516 返回体不正确`,
       );
 
       const okStream = await readSseUntilClose(
@@ -300,6 +359,19 @@ async function run() {
       assert(okStream.text.includes("[DONE]"), `${streamPath} 流式 128 未完整结束`);
       assert(!okStream.closedByError, `${streamPath} 流式 128 不应异常断开`);
     }
+
+    const terminatedStream = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      { stream: true, test_force_terminate: true },
+    );
+    assert(terminatedStream.status === 502, `/responses 上游半路断流未返回 502: ${terminatedStream.status}`);
+
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const logText = await readFile(logPath, "utf8");
+    assert(
+      !logText.includes("[error] TypeError: terminated"),
+      "上游半路断流后不应记录 terminated error 日志",
+    );
 
     process.stdout.write("PASS codex-retry-gateway e2e\n");
   } finally {

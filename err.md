@@ -7,9 +7,9 @@
 - 只解决 Codex 已可访问上游时的 `reasoning_tokens = 516` 重试问题
 - 不替代 `cc-switch` 的协议路由转换
 - 流式场景默认策略是：
-  - 先实时透传
+  - 先缓存上游流
   - 一旦检测到命中 `516`
-  - 直接断开连接
+  - 统一返回 `502`
 
 ### 当前已知限制
 
@@ -110,6 +110,32 @@
      - 测试改成相对 POSIX 路径执行 `.sh`
      - `.sh` 优先选择 `node.exe`
      - 在 WSL / Bash 场景下把路径参数转换回 Windows 路径后再交给 `node.exe`
+
+14. 上游流式连接中途终止时被误记为网关错误，首次瞬断也缺少最小重试
+   - 现象：
+     - 日志出现：
+       - `TypeError: terminated`
+       - `TypeError: fetch failed`
+     - 其中一部分来自上游 SSE 中途断流，另一部分来自上游首次连接瞬时失败
+   - 根因：
+     - `handleStreaming()` 直接把 `reader.read()` 抛出的 `AbortError` / `TypeError: terminated` 冒到统一错误处理
+     - `proxyRequest()` 对上游 `fetch()` 没有做一次轻量重试，首个瞬断会直接返回 `502`
+   - 处理：
+     - 新增预期流终止识别：
+       - `AbortError`
+       - `TypeError: terminated`
+     - 这两类在流式处理中按“连接已结束”收口，不再记 `[error]`
+     - 新增上游 `fetch failed` 的一次自动重试
+     - 新增严格 `502` 流式模式：
+       - 默认不再抢先透传 `200` 头和首个 chunk
+       - 先缓存流，再根据 `reasoning_tokens` 决定透传或返回 `502`
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增 `/responses` 流式覆盖
+       - 新增“上游半路断流不刷 error 日志”断言
+       - 新增“首次 fetch failed 后第二次成功恢复”断言
+       - 新增“流式 `516` 统一返回 `502`，不再先透传半截 chunk”断言
+     - `scripts/test-install-restore.mjs` 继续通过
 
 ### 2026-06-26 实测证据
 

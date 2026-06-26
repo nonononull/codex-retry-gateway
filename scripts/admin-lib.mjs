@@ -418,7 +418,7 @@ export async function installForCurrentProvider({
       existingGatewayConfig?.non_stream_status_code === undefined || existingGatewayConfig?.non_stream_status_code === null
         ? 502
         : Number.parseInt(`${existingGatewayConfig.non_stream_status_code}`, 10),
-    stream_action: existingGatewayConfig?.stream_action || "disconnect",
+    stream_action: existingGatewayConfig?.stream_action || "strict_502",
     log_match: existingGatewayConfig?.log_match === undefined ? true : Boolean(existingGatewayConfig.log_match),
     health_path: existingGatewayConfig?.health_path || DEFAULT_HEALTH_PATH,
   };
