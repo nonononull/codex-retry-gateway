@@ -6,7 +6,7 @@
   "endpoints": ["/responses", "/chat/completions", "/v1/responses", "/v1/chat/completions"],
   "reasoning_equals": [516],
   "non_stream_status_code": 502,
-  "stream_action": "disconnect",
+  "stream_action": "strict_502",
   "log_match": true,
   "health_path": "/__codex_retry_gateway/health"
 }

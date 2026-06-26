@@ -276,7 +276,7 @@ async function run() {
     endpoints: ["/responses", "/chat/completions", "/v1/responses", "/v1/chat/completions"],
     reasoning_equals: [516],
     non_stream_status_code: 502,
-    stream_action: "disconnect",
+    stream_action: "strict_502",
     log_match: true,
     health_path: "/__codex_retry_gateway/health",
   };
@@ -342,12 +342,13 @@ async function run() {
         `http://127.0.0.1:${gatewayPort}${streamPath}`,
         { stream: true, test_reasoning_tokens: 516 },
       );
-      assert(blockedStream.status === 200, `${streamPath} 516 首状态异常: ${blockedStream.status}`);
-      assert(blockedStream.text.includes("hello"), `${streamPath} 流式 516 未先透传正常 chunk`);
-      assert(!blockedStream.text.includes("[DONE]"), `${streamPath} 流式 516 不应完整结束`);
+      assert(blockedStream.status === 502, `${streamPath} 516 未返回 502: ${blockedStream.status}`);
+      assert(!blockedStream.text.includes("hello"), `${streamPath} 严格 502 模式不应先透传正常 chunk`);
+      assert(!blockedStream.text.includes("[DONE]"), `${streamPath} 严格 502 模式不应回放 DONE`);
+      const blockedStreamBody = JSON.parse(blockedStream.text);
       assert(
-        blockedStream.closedByError || blockedStream.text.includes("[[reader-error:"),
-        `${streamPath} 流式 516 未表现为中途断开`,
+        blockedStreamBody?.error?.code === "reasoning_guard_triggered",
+        `${streamPath} 流式 516 返回体不正确`,
       );
 
       const okStream = await readSseUntilClose(
@@ -363,10 +364,7 @@ async function run() {
       `http://127.0.0.1:${gatewayPort}/responses`,
       { stream: true, test_force_terminate: true },
     );
-    assert(
-      terminatedStream.text.includes("hello"),
-      "/responses 上游半路断流前未先透传正常 chunk",
-    );
+    assert(terminatedStream.status === 502, `/responses 上游半路断流未返回 502: ${terminatedStream.status}`);
 
     await new Promise((resolve) => setTimeout(resolve, 120));
     const logText = await readFile(logPath, "utf8");

@@ -62,7 +62,7 @@ $gatewayConfig = [ordered]@{
   endpoints = @($mergedEndpoints)
   reasoning_equals = Normalize-IntArray -Values $(if ($existingGatewayConfig) { $existingGatewayConfig.reasoning_equals } else { $null }) -Default @(516)
   non_stream_status_code = if ($existingGatewayConfig -and $null -ne $existingGatewayConfig.non_stream_status_code) { [int]$existingGatewayConfig.non_stream_status_code } else { 502 }
-  stream_action = if ($existingGatewayConfig -and -not [string]::IsNullOrWhiteSpace([string]$existingGatewayConfig.stream_action)) { [string]$existingGatewayConfig.stream_action } else { "disconnect" }
+  stream_action = if ($existingGatewayConfig -and -not [string]::IsNullOrWhiteSpace([string]$existingGatewayConfig.stream_action)) { [string]$existingGatewayConfig.stream_action } else { "strict_502" }
   log_match = if ($existingGatewayConfig -and $null -ne $existingGatewayConfig.log_match) { [bool]$existingGatewayConfig.log_match } else { $true }
   health_path = if ($existingGatewayConfig -and -not [string]::IsNullOrWhiteSpace([string]$existingGatewayConfig.health_path)) { [string]$existingGatewayConfig.health_path } else { "/__codex_retry_gateway/health" }
 }

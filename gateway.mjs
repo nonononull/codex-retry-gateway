@@ -24,7 +24,7 @@ const DEFAULT_CONFIG = {
   endpoints: ["/responses", "/chat/completions", "/v1/responses", "/v1/chat/completions"],
   reasoning_equals: [516],
   non_stream_status_code: 502,
-  stream_action: "disconnect",
+  stream_action: "strict_502",
   log_match: true,
   health_path: "/__codex_retry_gateway/health",
 };
@@ -63,7 +63,7 @@ function printHelp() {
       "说明:",
       "  独立 Codex 本地重试网关。",
       "  非流式命中 reasoning_tokens=516 时返回 502。",
-      "  流式命中时默认直接断开连接，交给 Codex 自身重试。",
+      "  流式命中时默认缓存并返回 502，避免半截流返回。",
       "",
     ].join("\n"),
   );
@@ -149,6 +149,16 @@ function buildBlockedBody(pathname, reasoning, statusCode) {
       code: "reasoning_guard_triggered",
       reasoning_tokens: reasoning,
       status_code: statusCode,
+    },
+  });
+}
+
+function buildGatewayErrorBody(message) {
+  return JSON.stringify({
+    error: {
+      message,
+      type: "codex_retry_gateway_error",
+      code: "gateway_error",
     },
   });
 }
@@ -1316,9 +1326,7 @@ async function handleStreaming({
   res,
   abortController,
 }) {
-  copyHeadersToClient(upstreamResponse.headers, res);
-  res.writeHead(upstreamResponse.status);
-
+  const strict502Mode = config.stream_action !== "disconnect";
   const reader = upstreamResponse.body.getReader();
   const sseState = {
     decoder: new TextDecoder("utf8"),
@@ -1327,6 +1335,13 @@ async function handleStreaming({
 
   let wroteAnyChunk = false;
   let observedReasoning = null;
+  const bufferedChunks = [];
+
+  if (!strict502Mode) {
+    copyHeadersToClient(upstreamResponse.headers, res);
+    res.writeHead(upstreamResponse.status);
+  }
+
   while (true) {
     let readResult;
     try {
@@ -1334,7 +1349,13 @@ async function handleStreaming({
     } catch (error) {
       if (isExpectedStreamTermination(error)) {
         recordInspectedResponse(monitor, observedReasoning, false);
-        res.end();
+        if (strict502Mode) {
+          logger?.(`[stream] upstream terminated before completion path=${pathname} action=status_502`);
+          res.writeHead(502, { "content-type": "application/json; charset=utf-8" });
+          res.end(buildGatewayErrorBody("upstream stream terminated before completion"));
+        } else {
+          res.end();
+        }
         return;
       }
       throw error;
@@ -1343,10 +1364,17 @@ async function handleStreaming({
     const { done, value } = readResult;
     if (done) {
       recordInspectedResponse(monitor, observedReasoning, false);
-      res.end();
+      if (strict502Mode) {
+        copyHeadersToClient(upstreamResponse.headers, res);
+        res.writeHead(upstreamResponse.status);
+        res.end(Buffer.concat(bufferedChunks));
+      } else {
+        res.end();
+      }
       return;
     }
 
+    const chunkBuffer = Buffer.from(value);
     const reasoning = inspectSseChunk(sseState, value);
     if (Number.isInteger(reasoning)) {
       observedReasoning = reasoning;
@@ -1359,14 +1387,14 @@ async function handleStreaming({
         );
       }
 
-      if (!wroteAnyChunk) {
+      if (strict502Mode || !wroteAnyChunk) {
+        abortController.abort();
+        reader.cancel().catch(() => {});
         const blockedBody = buildBlockedBody(pathname, reasoning, config.non_stream_status_code);
-        if (!res.headersSent) {
-          res.writeHead(config.non_stream_status_code, {
-            "content-type": "application/json; charset=utf-8",
-            "x-codex-retry-gateway-reason": "reasoning-guard-triggered",
-          });
-        }
+        res.writeHead(config.non_stream_status_code, {
+          "content-type": "application/json; charset=utf-8",
+          "x-codex-retry-gateway-reason": "reasoning-guard-triggered",
+        });
         res.end(blockedBody);
       } else {
         abortController.abort();
@@ -1376,8 +1404,12 @@ async function handleStreaming({
       return;
     }
 
-    wroteAnyChunk = true;
-    res.write(Buffer.from(value));
+    if (strict502Mode) {
+      bufferedChunks.push(chunkBuffer);
+    } else {
+      wroteAnyChunk = true;
+      res.write(chunkBuffer);
+    }
   }
 }
 
