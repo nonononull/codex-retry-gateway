@@ -137,6 +137,196 @@
        - 新增“流式 `516` 统一返回 `502`，不再先透传半截 chunk”断言
      - `scripts/test-install-restore.mjs` 继续通过
 
+15. 管理页刷新会把代理请求总数加一
+   - 现象：
+     - 打开或刷新 `__codex_retry_gateway/ui` 后，页面里的“代理请求总数”会额外增加
+   - 根因：
+     - 浏览器自动请求 `/favicon.ico`
+     - 网关未把该请求识别为管理页附属资源，落入普通代理路径并计入 `total_proxy_request_count`
+   - 处理：
+     - 在管理请求分支提前处理 `/favicon.ico`
+     - 直接返回 `204`
+     - 不再进入普通代理计数
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增“管理页刷新相关请求不应增加代理请求总数”断言
+
+16. 新增模型家族一致性检测与单请求高风险漂移检测
+   - 目标：
+     - 本地模型为 `gpt-5.4` / `gpt-5.5` 时，检查链路声明和行为是否符合 `1M` 家族特征
+   - 处理：
+     - 新增本地请求模型、上游声明模型、流式声明模型统计
+     - 新增声明一致率与最近可疑样本
+     - 新增 `400K` 家族异常检测
+     - 新增单请求模型漂移检测
+     - 新增疑似请求内重建/重试检测
+   - 证据保留：
+     - 每条可疑样本保留：
+       - 本地期望模型
+       - 上游声明模型
+       - 流式声明模型
+       - 首个观测模型
+       - 最后观测模型
+       - 模型集合
+       - 指纹集合
+   - 边界：
+     - 声明一致不等于已证明真实运行一致
+     - `400K` 家族异常只表示行为上疑似不符合 `1M` 家族
+     - 单请求模型漂移与疑似请求内重建/重试都按高风险展示
+     - 无法直接确认 provider 内部缓存重建
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增 `gpt-5.4` / `gpt-5.5` 一致声明断言
+       - 新增 `mini` 声明不一致断言
+       - 新增 `400000 context window` 异常断言
+       - 新增单请求模型漂移断言
+       - 新增疑似请求内重建/重试断言
+
+17. 管理页内联脚本语法错误会导致整页状态全部不灌值
+   - 现象：
+     - `运行状态`、`拦截规则`、`模型家族一致性` 都显示为初始空值
+     - 浏览器控制台报：
+       - `SyntaxError: Invalid or unexpected token`
+   - 根因：
+     - 新增“日志证据”展示时，内联脚本里的 `join('\n')` 被模板 HTML 吃成了真实换行
+     - 最终生成的 `<script>` 语法非法，初始化逻辑完全没有执行
+   - 处理：
+     - 改成 `join('\\n')`
+     - 在 `scripts/test-gateway-e2e.mjs` 里新增“管理页内联脚本可被 `vm.Script` 解析”断言
+
+18. Unix `.sh` 入口在 Bash 下因为 CRLF 行尾直接失败
+   - 现象：
+     - `scripts/test-launch-ui-unix.mjs` 失败
+     - Bash 报错：
+       - `set: pipefail\r: invalid option name`
+   - 根因：
+     - `.sh` 文件被写成了 `CRLF`
+     - Bash 把 `\r` 当成命令内容的一部分
+   - 处理：
+     - 把所有 `.sh` 入口统一转成 `LF`
+     - 新增仓库级 `.gitattributes`
+       - `*.sh text eol=lf`
+
+19. 最近可疑样本里的“查看日志”会在自动刷新后瞬间收起
+   - 现象：
+     - 点开“日志证据”里的 `查看 N 条`
+     - 约 2 秒一次的页面轮询后会自动收起
+   - 根因：
+     - `renderSuspiciousSamples()` 每次轮询都会整体重写 `tbody.innerHTML`
+     - `<details>` 的展开态属于 DOM 本地状态，节点被重建后自然丢失
+   - 处理：
+     - 给最近可疑样本增加签名比对
+     - 样本数据没变化时不重绘
+     - 样本数据有变化时保留用户已展开的 `data-sample-key` 状态并恢复
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增“最近可疑样本未变化时不应重绘日志证据 DOM”断言
+       - 新增“最近可疑样本刷新后已展开的日志证据不应自动收起”断言
+
+20. 正常拦截流式 `516` 会被误报成 `single_request_rebuild_suspected`
+   - 现象：
+     - `/responses` 流式命中 `reasoning_tokens = 516` 被本地严格 `502` 正常拦截后
+     - 管理页仍可能出现：
+       - `single_request_rebuild_suspected`
+   - 根因：
+     - 流式 SSE 事件里的顶层 `id` 可能只是事件 id，不是响应 `response.id`
+     - 监控层此前把流式 payload 顶层 `id` 也记进 `observedResponseIds`
+     - 同一请求里多个事件 id 被误当成多个响应 id，触发“疑似请求内重建/重试”
+   - 处理：
+     - `extractPayloadResponseId()` 改为仅在非流式场景允许回退到 payload 顶层 `id`
+     - 流式场景只认 `payload.response.id`
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增“带事件 id 的 516 流式请求未返回 502”覆盖
+       - 新增“正常拦截 516 不应计入疑似请求内重建/重试”断言
+       - 新增“正常拦截 516 不应生成 single_request_rebuild_suspected 可疑样本”断言
+
+21. 管理页实时日志时间显示与本机时间不一致，且代理请求总数与被检查响应总数差值缺少解释
+   - 现象：
+     - “实时日志”直接显示原始 UTC 时间串
+     - `代理请求总数` 与 `被检查响应总数` 存在差值时，页面看不出是哪些请求造成的
+   - 根因：
+     - `renderLogs()` 直接输出 `entry.at`，没有复用 `formatTimestamp()`
+     - `total_proxy_request_count` 统计的是所有进入普通代理分支的请求
+     - `inspected_response_count` 只统计真正进入检查逻辑的响应
+     - 像 `/v1/models` 这类未纳入 `endpoints` 检查范围的透传请求会进入代理总数，但不会进入被检查总数
+   - 处理：
+     - `renderLogs()` 改为统一走 `formatTimestamp()`
+     - 新增运行期统计：
+       - `bypassed_proxy_request_count`
+       - `bypassed_proxy_path_counts`
+       - `failed_proxy_request_count`
+     - 在“运行状态”脚注里明确展示：
+       - 总数计算口径
+       - 当前差值
+       - 未纳入检查的透传路径分布
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增“实时日志应显示与系统时间一致的本地时间”断言
+       - 新增“运行状态脚注应提示未纳入检查的透传路径”断言
+       - 新增“代理请求总数与被检查响应总数的差值应能由透传请求和失败请求解释”断言
+
+22. 管理页差值在慢请求进行中会继续放大，但页面之前没有把“进行中的代理请求”单独解释出来
+   - 现象：
+     - `代理请求总数` 与 `被检查响应总数` 的差值不只出现在透传或失败请求场景
+     - 当普通代理请求仍在执行中时，差值会临时增大，但页面之前无法说明来源
+   - 根因：
+     - 缺少运行期 `active` 统计
+     - `proxyRequest()` 也没有把普通代理请求生命周期包进开始/结束计数
+   - 处理：
+     - 新增运行期统计：
+       - `active_proxy_request_count`
+       - `active_proxy_path_counts`
+     - 在普通代理请求进入后立刻记 `active start`
+     - 无论成功、旁路、流式、非流式还是失败，都在 `finally` 里记 `active end`
+     - “运行状态”脚注改成：
+       - `代理请求总数 = 被检查响应总数 + 未纳入检查的透传请求 + 失败请求 + 进行中的代理请求`
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增“代理请求进行中时应记录 active_proxy_request_count”断言
+       - 新增“代理请求进行中时应记录 active_proxy_path_counts”断言
+       - 新增“代理请求结束后 active_proxy_request_count 应回到 0”断言
+
+23. 声明一致率把 `unknown` 也算进分母，导致百分比与“不一致次数 / 可疑样本”口径互相打架
+   - 现象：
+     - 管理页里“声明一致率”可能不是 `100%`
+     - 但“声明不一致次数”仍然是 `0`
+     - 最近可疑样本也没有 `model_family_mismatch`
+   - 根因：
+     - 一致率此前按：
+       - `matched / total_checked`
+     - 其中 `unknown` 表示本次没有拿到可比对的上游声明，它不该被计入“不一致”，却被错误计入了一致率分母
+   - 处理：
+     - 一致率改为只按已声明样本计算：
+       - `matched / (matched + mismatched)`
+     - `unknown` 继续单独保留，但不再拉低一致率
+     - 管理页文案补充“未声明样本不计入分母”
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增“声明一致率应只按已声明样本计算”断言
+       - 新增 `gpt-5.4` / `gpt-5.5` 家族一致率排除 `unknown` 断言
+
+24. 网关重启后管理页会把上一次会话的旧日志继续留在页面里，导致“实时日志时间仍不对”
+   - 现象：
+     - 网关已重启、`started_at` 已变成新会话
+     - 但“实时日志”区域仍可能保留上一轮会话里的旧文本
+     - `logsMeta` 会显示新的日志总数，`logsOutput` 却还是旧内容
+   - 根因：
+     - 管理页日志轮询依赖 `since_seq`
+     - 网关重启后，新的日志序号会从小值重新开始
+     - 页面若继续沿用旧的 `lastLogSeq` 做增量请求，会拿不到完整新日志
+     - 旧页面内容因此不会被替换
+   - 处理：
+     - 页面保存上一轮 `metrics.started_at`
+     - 检测到 `started_at` 变化后，立即清空增量游标并全量重拉日志
+     - 若增量响应里的 `latest_seq` 小于当前游标，也自动回退为全量重拉
+     - 管理页 HTML 与管理接口统一补 `cache-control: no-store`
+   - 验证：
+     - `scripts/test-gateway-e2e.mjs`
+       - 新增“网关重启后实时日志应重新全量加载并显示本地时间”断言
+       - 新增“网关重启后不应继续保留上一次会话的旧日志”断言
+       - 新增“检测到网关重启后应全量重拉日志”断言
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

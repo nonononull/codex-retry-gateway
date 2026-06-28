@@ -15,6 +15,7 @@ const STATUS_API_PATH = `${ADMIN_BASE_PATH}/api/status`;
 const CONFIG_API_PATH = `${ADMIN_BASE_PATH}/api/config`;
 const LOGS_API_PATH = `${ADMIN_BASE_PATH}/api/logs`;
 const RESTORE_API_PATH = `${ADMIN_BASE_PATH}/api/restore`;
+const FAVICON_PATH = "/favicon.ico";
 
 const DEFAULT_CONFIG = {
   listen_host: "127.0.0.1",
@@ -35,6 +36,9 @@ const REASONING_POINTERS = [
   "/response/usage/output_tokens_details/reasoning_tokens",
   "/response/usage/completion_tokens_details/reasoning_tokens",
 ];
+const TRACKED_LOCAL_MODEL_FAMILIES = new Set(["gpt-5.4", "gpt-5.5"]);
+const SUSPICIOUS_SAMPLE_LIMIT = 50;
+const SUSPICIOUS_SAMPLE_EVIDENCE_LIMIT = 6;
 
 function parseArgs(argv) {
   const args = { config: null, log: null };
@@ -116,6 +120,106 @@ function extractReasoningTokens(payload) {
   return null;
 }
 
+function extractTopLevelModel(content) {
+  const [topLevelBlock] = `${content || ""}`.split(/^\[/m);
+  const match = topLevelBlock.match(/^\s*model\s*=\s*"([^"]+)"\s*$/m);
+  return match ? match[1] : null;
+}
+
+function normalizeModelFamily(modelName) {
+  if (!modelName) {
+    return "unknown";
+  }
+
+  const value = `${modelName}`.trim().toLowerCase();
+  if (!value) {
+    return "unknown";
+  }
+  if (value.startsWith("gpt-5.4-mini")) {
+    return "gpt-5.4-mini";
+  }
+  if (value.startsWith("gpt-5.5-mini")) {
+    return "gpt-5.5-mini";
+  }
+  if (value.startsWith("gpt-5.4-nano")) {
+    return "gpt-5.4-nano";
+  }
+  if (value.startsWith("gpt-5.5-nano")) {
+    return "gpt-5.5-nano";
+  }
+  if (value.startsWith("gpt-5.4")) {
+    return "gpt-5.4";
+  }
+  if (value.startsWith("gpt-5.5")) {
+    return "gpt-5.5";
+  }
+  if (value.includes("mini")) {
+    return "mini";
+  }
+  if (value.includes("nano")) {
+    return "nano";
+  }
+  return "other";
+}
+
+function incrementStringCount(counter, value) {
+  if (!value) {
+    return;
+  }
+  const key = `${value}`;
+  counter[key] = (counter[key] || 0) + 1;
+}
+
+function extractPayloadModels(payload) {
+  const models = [];
+  if (typeof payload?.model === "string") {
+    models.push(payload.model);
+  }
+  if (typeof payload?.response?.model === "string") {
+    models.push(payload.response.model);
+  }
+  return [...new Set(models)];
+}
+
+function extractPayloadSystemFingerprint(payload) {
+  if (typeof payload?.system_fingerprint === "string") {
+    return payload.system_fingerprint;
+  }
+  if (typeof payload?.response?.system_fingerprint === "string") {
+    return payload.response.system_fingerprint;
+  }
+  return null;
+}
+
+function extractPayloadServiceTier(payload) {
+  if (typeof payload?.service_tier === "string") {
+    return payload.service_tier;
+  }
+  if (typeof payload?.response?.service_tier === "string") {
+    return payload.response.service_tier;
+  }
+  return null;
+}
+
+function extractPayloadResponseId(payload, options = {}) {
+  if (typeof payload?.response?.id === "string") {
+    return payload.response.id;
+  }
+  if (options.allowTopLevelId && typeof payload?.id === "string") {
+    return payload.id;
+  }
+  return null;
+}
+
+function looksLikeLowContextFamilyError(payload) {
+  const text = JSON.stringify(payload || {}).toLowerCase();
+  return (
+    text.includes("400000") ||
+    text.includes("400k") ||
+    text.includes("context_length_exceeded")
+  );
+}
+
 function normalizeIntegerList(values, fallback = []) {
   const source = values === undefined || values === null ? fallback : values;
   const normalized = flattenValues(source)
@@ -141,6 +245,50 @@ function normalizeStringList(values, fallback = []) {
   return [...new Set(normalized)];
 }
 
+function createFamilyBreakdownEntry() {
+  return {
+    consistency: {
+      total_checked: 0,
+      matched: 0,
+      mismatched: 0,
+      unknown: 0,
+    },
+    anomalies: {
+      low_context_family_count: 0,
+    },
+    single_request_anomalies: {
+      model_drift_count: 0,
+      fingerprint_drift_count: 0,
+      rebuild_suspected_count: 0,
+    },
+  };
+}
+
+function createTrackedFamilyBreakdown() {
+  const breakdown = {};
+  for (const family of TRACKED_LOCAL_MODEL_FAMILIES) {
+    breakdown[family] = createFamilyBreakdownEntry();
+  }
+  return breakdown;
+}
+
+function calculateConsistencyMatchRatio(consistency) {
+  const matched = Number(consistency?.matched || 0);
+  const mismatched = Number(consistency?.mismatched || 0);
+  const declaredChecked = matched + mismatched;
+  return declaredChecked === 0 ? 0 : matched / declaredChecked;
+}
+
+function getFamilyBreakdownEntry(monitor, family) {
+  if (!TRACKED_LOCAL_MODEL_FAMILIES.has(family)) {
+    return null;
+  }
+  if (!monitor.family_breakdown[family]) {
+    monitor.family_breakdown[family] = createFamilyBreakdownEntry();
+  }
+  return monitor.family_breakdown[family];
+}
+
 function buildBlockedBody(pathname, reasoning, statusCode) {
   return JSON.stringify({
     error: {
@@ -163,6 +311,40 @@ function buildGatewayErrorBody(message) {
   });
 }
 
+function parseSsePayloads(state, chunk) {
+  const decoded = state.decoder.decode(chunk, { stream: true });
+  state.buffer += decoded;
+
+  const blocks = state.buffer.split(/\r?\n\r?\n/);
+  state.buffer = blocks.pop() ?? "";
+  const payloads = [];
+
+  for (const block of blocks) {
+    const lines = block
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter(Boolean);
+    const dataLines = lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.replace(/^data:\s?/, ""));
+
+    if (dataLines.length === 0) {
+      continue;
+    }
+    const payloadText = dataLines.join("\n");
+    if (payloadText === "[DONE]") {
+      continue;
+    }
+    try {
+      payloads.push(JSON.parse(payloadText));
+    } catch {
+      // ignore malformed SSE payloads
+    }
+  }
+
+  return payloads;
+}
+
 function createMonitor() {
   return {
     started_at: new Date().toISOString(),
@@ -170,8 +352,32 @@ function createMonitor() {
     log_entries: [],
     total_proxy_request_count: 0,
     inspected_response_count: 0,
+    bypassed_proxy_request_count: 0,
+    bypassed_proxy_path_counts: {},
+    failed_proxy_request_count: 0,
+    active_proxy_request_count: 0,
+    active_proxy_path_counts: {},
     matched_response_count: 0,
     observed_reasoning_counts: {},
+    local_model_counts: {},
+    upstream_model_counts: {},
+    stream_model_counts: {},
+    model_consistency: {
+      total_checked: 0,
+      matched: 0,
+      mismatched: 0,
+      unknown: 0,
+    },
+    model_family_anomalies: {
+      low_context_family_count: 0,
+    },
+    single_request_anomalies: {
+      model_drift_count: 0,
+      fingerprint_drift_count: 0,
+      rebuild_suspected_count: 0,
+    },
+    family_breakdown: createTrackedFamilyBreakdown(),
+    suspicious_model_samples: [],
   };
 }
 
@@ -221,6 +427,251 @@ function recordInspectedResponse(monitor, reasoning, matched) {
   }
 }
 
+function recordBypassedProxyRequest(monitor, pathname) {
+  monitor.bypassed_proxy_request_count += 1;
+  incrementStringCount(monitor.bypassed_proxy_path_counts, pathname || "(unknown)");
+}
+
+function recordActiveProxyRequestStart(monitor, pathname) {
+  monitor.active_proxy_request_count += 1;
+  incrementStringCount(monitor.active_proxy_path_counts, pathname || "(unknown)");
+}
+
+function recordActiveProxyRequestEnd(monitor, pathname) {
+  monitor.active_proxy_request_count = Math.max(0, monitor.active_proxy_request_count - 1);
+  const key = pathname || "(unknown)";
+  const nextCount = (monitor.active_proxy_path_counts[key] || 0) - 1;
+  if (nextCount > 0) {
+    monitor.active_proxy_path_counts[key] = nextCount;
+  } else {
+    delete monitor.active_proxy_path_counts[key];
+  }
+}
+
+function setRequestTrackingOutcome(requestTracking, outcome) {
+  if (!requestTracking) {
+    return;
+  }
+  requestTracking.outcome = outcome;
+  if (requestTracking.req) {
+    requestTracking.req.__codexRetryGatewayProxyOutcome = outcome;
+  }
+}
+
+function createRequestModelContext(localConfigModel, requestModel) {
+  return {
+    localConfigModel: localConfigModel || null,
+    localRequestModel: requestModel || null,
+    effectiveLocalModel: requestModel || localConfigModel || null,
+    upstreamModel: null,
+    streamModel: null,
+    finalResponseModel: null,
+    serviceTier: null,
+    systemFingerprint: null,
+    responseId: null,
+    firstObservedModel: null,
+    lastObservedModel: null,
+    observedModels: new Set(),
+    observedModelFamilies: new Set(),
+    observedFingerprints: new Set(),
+    observedResponseIds: new Set(),
+  };
+}
+
+function recordObservedModel(context, modelName) {
+  if (!modelName) {
+    return;
+  }
+  const normalized = `${modelName}`;
+  context.observedModels.add(normalized);
+  context.observedModelFamilies.add(normalizeModelFamily(normalized));
+  if (!context.firstObservedModel) {
+    context.firstObservedModel = normalized;
+  }
+  context.lastObservedModel = normalized;
+}
+
+function recordObservedFingerprint(context, fingerprint) {
+  if (!fingerprint) {
+    return;
+  }
+  const normalized = `${fingerprint}`;
+  context.observedFingerprints.add(normalized);
+  context.systemFingerprint = normalized;
+}
+
+function recordObservedResponseId(context, responseId) {
+  if (!responseId) {
+    return;
+  }
+  const normalized = `${responseId}`;
+  context.observedResponseIds.add(normalized);
+  context.responseId = normalized;
+}
+
+function collectSuspiciousSampleEvidenceLogs(monitor, pathname, context, anomalyType, confidence) {
+  const relatedEntries = monitor.log_entries
+    .filter((entry) => entry?.message?.includes(`path=${pathname}`))
+    .slice(-(SUSPICIOUS_SAMPLE_EVIDENCE_LIMIT - 1))
+    .map((entry) => ({
+      seq: entry.seq,
+      at: entry.at,
+      message: entry.message,
+    }));
+
+  const summaryEntry = {
+    seq: null,
+    at: new Date().toISOString(),
+    message:
+      `[sample] path=${pathname} anomaly=${anomalyType} confidence=${confidence} ` +
+      `local=${context.effectiveLocalModel || "-"} upstream=${context.upstreamModel || "-"} ` +
+      `stream=${context.streamModel || "-"} first=${context.firstObservedModel || "-"} ` +
+      `last=${context.lastObservedModel || "-"} models=${[...context.observedModels].join("|") || "-"} ` +
+      `fingerprints=${[...context.observedFingerprints].join("|") || "-"}`,
+  };
+
+  return [...relatedEntries, summaryEntry];
+}
+
+function applyPayloadModelSignals(context, payload, options = {}) {
+  const models = extractPayloadModels(payload);
+  for (const modelName of models) {
+    recordObservedModel(context, modelName);
+  }
+
+  const fingerprint = extractPayloadSystemFingerprint(payload);
+  if (fingerprint) {
+    recordObservedFingerprint(context, fingerprint);
+  }
+
+  const serviceTier = extractPayloadServiceTier(payload);
+  if (serviceTier) {
+    context.serviceTier = `${serviceTier}`;
+  }
+
+  const responseId = extractPayloadResponseId(payload, {
+    allowTopLevelId: !options.fromStream,
+  });
+  if (responseId) {
+    recordObservedResponseId(context, responseId);
+  }
+
+  if (options.fromStream && models.length > 0) {
+    context.streamModel = models[models.length - 1];
+  }
+  if (options.fromFinalResponse && models.length > 0) {
+    context.finalResponseModel = models[models.length - 1];
+  }
+  if (!options.fromStream && models.length > 0) {
+    context.upstreamModel = models[models.length - 1];
+  }
+}
+
+function pushSuspiciousModelSample(monitor, pathname, context, anomalyType, confidence) {
+  monitor.suspicious_model_samples.unshift({
+    ts: new Date().toISOString(),
+    path: pathname,
+    local_config_model: context.localConfigModel,
+    local_request_model: context.localRequestModel,
+    effective_local_model: context.effectiveLocalModel,
+    upstream_model: context.upstreamModel,
+    stream_model: context.streamModel,
+    first_observed_model: context.firstObservedModel,
+    last_observed_model: context.lastObservedModel,
+    observed_models: [...context.observedModels],
+    observed_model_families: [...context.observedModelFamilies],
+    system_fingerprint: context.systemFingerprint,
+    observed_fingerprints: [...context.observedFingerprints],
+    service_tier: context.serviceTier,
+    anomaly_type: anomalyType,
+    confidence,
+    evidence_logs: collectSuspiciousSampleEvidenceLogs(
+      monitor,
+      pathname,
+      context,
+      anomalyType,
+      confidence,
+    ),
+  });
+  if (monitor.suspicious_model_samples.length > SUSPICIOUS_SAMPLE_LIMIT) {
+    monitor.suspicious_model_samples.length = SUSPICIOUS_SAMPLE_LIMIT;
+  }
+}
+
+function finalizeModelInsights(monitor, pathname, context, errorPayload = null) {
+  const effectiveLocalModel = context.effectiveLocalModel;
+  const effectiveFamily = normalizeModelFamily(effectiveLocalModel);
+  const familyBreakdown = getFamilyBreakdownEntry(monitor, effectiveFamily);
+
+  if (effectiveLocalModel) {
+    incrementStringCount(monitor.local_model_counts, effectiveLocalModel);
+  }
+  if (context.upstreamModel) {
+    incrementStringCount(monitor.upstream_model_counts, context.upstreamModel);
+  }
+  if (context.streamModel) {
+    incrementStringCount(monitor.stream_model_counts, context.streamModel);
+  }
+
+  if (TRACKED_LOCAL_MODEL_FAMILIES.has(effectiveFamily)) {
+    monitor.model_consistency.total_checked += 1;
+    familyBreakdown.consistency.total_checked += 1;
+    const declaredModel = context.upstreamModel || context.streamModel || context.finalResponseModel;
+    const declaredFamily = normalizeModelFamily(declaredModel);
+    if (declaredFamily === "unknown") {
+      monitor.model_consistency.unknown += 1;
+      familyBreakdown.consistency.unknown += 1;
+    } else if (declaredFamily === effectiveFamily) {
+      monitor.model_consistency.matched += 1;
+      familyBreakdown.consistency.matched += 1;
+    } else {
+      monitor.model_consistency.mismatched += 1;
+      familyBreakdown.consistency.mismatched += 1;
+      pushSuspiciousModelSample(monitor, pathname, context, "model_family_mismatch", "high");
+    }
+  }
+
+  if (looksLikeLowContextFamilyError(errorPayload)) {
+    monitor.model_family_anomalies.low_context_family_count += 1;
+    if (familyBreakdown) {
+      familyBreakdown.anomalies.low_context_family_count += 1;
+    }
+    pushSuspiciousModelSample(monitor, pathname, context, "low_context_family_behavior", "high");
+  }
+
+  if (context.observedModelFamilies.size > 1) {
+    monitor.single_request_anomalies.model_drift_count += 1;
+    if (familyBreakdown) {
+      familyBreakdown.single_request_anomalies.model_drift_count += 1;
+    }
+    pushSuspiciousModelSample(monitor, pathname, context, "single_request_model_drift", "high");
+  } else if (context.observedFingerprints.size > 1) {
+    monitor.single_request_anomalies.fingerprint_drift_count += 1;
+    monitor.single_request_anomalies.rebuild_suspected_count += 1;
+    if (familyBreakdown) {
+      familyBreakdown.single_request_anomalies.fingerprint_drift_count += 1;
+      familyBreakdown.single_request_anomalies.rebuild_suspected_count += 1;
+    }
+    pushSuspiciousModelSample(monitor, pathname, context, "single_request_rebuild_suspected", "high");
+  } else if (
+    context.finalResponseModel &&
+    context.streamModel &&
+    normalizeModelFamily(context.finalResponseModel) !== normalizeModelFamily(context.streamModel)
+  ) {
+    monitor.single_request_anomalies.rebuild_suspected_count += 1;
+    if (familyBreakdown) {
+      familyBreakdown.single_request_anomalies.rebuild_suspected_count += 1;
+    }
+    pushSuspiciousModelSample(monitor, pathname, context, "single_request_rebuild_suspected", "high");
+  } else if (context.observedResponseIds.size > 1) {
+    monitor.single_request_anomalies.rebuild_suspected_count += 1;
+    if (familyBreakdown) {
+      familyBreakdown.single_request_anomalies.rebuild_suspected_count += 1;
+    }
+    pushSuspiciousModelSample(monitor, pathname, context, "single_request_rebuild_suspected", "high");
+  }
+}
+
 function buildMetricsSnapshot(monitor) {
   const reasoning516Count = monitor.observed_reasoning_counts["516"] || 0;
   const inspectedResponseCount = monitor.inspected_response_count;
@@ -228,11 +679,55 @@ function buildMetricsSnapshot(monitor) {
     started_at: monitor.started_at,
     total_proxy_request_count: monitor.total_proxy_request_count,
     inspected_response_count: inspectedResponseCount,
+    bypassed_proxy_request_count: monitor.bypassed_proxy_request_count,
+    bypassed_proxy_path_counts: { ...monitor.bypassed_proxy_path_counts },
+    failed_proxy_request_count: monitor.failed_proxy_request_count,
+    active_proxy_request_count: monitor.active_proxy_request_count,
+    active_proxy_path_counts: { ...monitor.active_proxy_path_counts },
     matched_response_count: monitor.matched_response_count,
     reasoning_516_count: reasoning516Count,
     reasoning_516_ratio:
       inspectedResponseCount === 0 ? 0 : reasoning516Count / inspectedResponseCount,
     observed_reasoning_counts: { ...monitor.observed_reasoning_counts },
+  };
+}
+
+function buildModelInsightsSnapshot(runtime) {
+  const consistency = runtime.monitor.model_consistency;
+  const familyBreakdown = {};
+  for (const family of TRACKED_LOCAL_MODEL_FAMILIES) {
+    const bucket = runtime.monitor.family_breakdown?.[family] || createFamilyBreakdownEntry();
+    const bucketConsistency = bucket.consistency || createFamilyBreakdownEntry().consistency;
+    familyBreakdown[family] = {
+      consistency: {
+        ...bucketConsistency,
+        match_ratio: calculateConsistencyMatchRatio(bucketConsistency),
+      },
+      anomalies: { ...(bucket.anomalies || createFamilyBreakdownEntry().anomalies) },
+      single_request_anomalies: {
+        ...(bucket.single_request_anomalies || createFamilyBreakdownEntry().single_request_anomalies),
+      },
+    };
+  }
+  return {
+    local_config_model: runtime.localConfigModelCache || null,
+    local_config_family: normalizeModelFamily(runtime.localConfigModelCache),
+    local_model_counts: { ...runtime.monitor.local_model_counts },
+    upstream_model_counts: { ...runtime.monitor.upstream_model_counts },
+    stream_model_counts: { ...runtime.monitor.stream_model_counts },
+    consistency: {
+      ...consistency,
+      match_ratio: calculateConsistencyMatchRatio(consistency),
+    },
+    anomalies: { ...runtime.monitor.model_family_anomalies },
+    single_request_anomalies: { ...runtime.monitor.single_request_anomalies },
+    family_breakdown: familyBreakdown,
+    suspicious_samples: runtime.monitor.suspicious_model_samples.map((sample) => ({
+      ...sample,
+      evidence_logs: Array.isArray(sample.evidence_logs)
+        ? sample.evidence_logs.map((entry) => ({ ...entry }))
+        : [],
+    })),
   };
 }
 
@@ -246,6 +741,27 @@ function buildLogsSnapshot(monitor, sinceSeq = null) {
     latest_seq: monitor.next_log_seq - 1,
     entries,
   };
+}
+
+async function readLocalConfigModel(runtime) {
+  const state = await readOptionalJson(runtime.paths.statePath);
+  const configPath = state?.codex_config_path;
+  if (!configPath) {
+    return null;
+  }
+
+  try {
+    const content = await readFile(configPath, "utf8");
+    return extractTopLevelModel(content);
+  } catch {
+    return null;
+  }
+}
+
+async function getLocalConfigModel(runtime) {
+  const model = await readLocalConfigModel(runtime);
+  runtime.localConfigModelCache = model;
+  return model;
 }
 
 async function loadConfig(configPath) {
@@ -349,13 +865,19 @@ async function restoreRuntimeState(runtime, state) {
 function jsonResponse(res, statusCode, payload, headers = {}) {
   res.writeHead(statusCode, {
     "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store, max-age=0",
+    pragma: "no-cache",
     ...headers,
   });
   res.end(JSON.stringify(payload));
 }
 
 function htmlResponse(res, html) {
-  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store, max-age=0",
+    pragma: "no-cache",
+  });
   res.end(html);
 }
 
@@ -575,11 +1097,25 @@ function buildManagementHtml() {
       .inline-toggle {
         display: flex;
         align-items: center;
+        justify-content: flex-start;
         gap: 10px;
         padding: 12px 14px;
         border-radius: 16px;
         background: var(--panel-strong);
         border: 1px solid rgba(31, 29, 26, 0.08);
+      }
+
+      .inline-toggle input[type="checkbox"] {
+        width: 16px;
+        height: 16px;
+        margin: 0;
+        padding: 0;
+        flex: 0 0 auto;
+      }
+
+      .inline-toggle label {
+        margin: 0;
+        cursor: pointer;
       }
 
       .actions {
@@ -657,6 +1193,83 @@ function buildManagementHtml() {
         word-break: break-word;
       }
 
+      .distribution {
+        display: grid;
+        gap: 12px;
+      }
+
+      .distribution-item {
+        padding: 12px 14px;
+        border-radius: 16px;
+        background: var(--panel-strong);
+        border: 1px solid rgba(31, 29, 26, 0.08);
+      }
+
+      .distribution-item strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .table-wrap {
+        overflow-x: auto;
+        border-radius: 18px;
+        border: 1px solid rgba(31, 29, 26, 0.08);
+        background: var(--panel-strong);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        min-width: 900px;
+      }
+
+      th,
+      td {
+        padding: 12px 14px;
+        border-bottom: 1px solid rgba(31, 29, 26, 0.08);
+        text-align: left;
+        vertical-align: top;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      th {
+        background: rgba(31, 111, 95, 0.08);
+      }
+
+      .risk-note {
+        margin: 0 0 14px;
+        padding: 12px 14px;
+        border-radius: 16px;
+        background: #fff8ef;
+        border: 1px solid rgba(162, 81, 47, 0.18);
+        color: #6b3b1f;
+        font-size: 13px;
+        line-height: 1.7;
+      }
+
+      .evidence-details {
+        min-width: 220px;
+      }
+
+      .evidence-details summary {
+        cursor: pointer;
+        color: var(--accent);
+        font-weight: 700;
+      }
+
+      .evidence-log-output {
+        margin: 8px 0 0;
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: rgba(31, 29, 26, 0.04);
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-family: "Cascadia Code", "Consolas", monospace;
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
       code {
         font-family: "Cascadia Code", "Consolas", monospace;
         font-size: 0.92em;
@@ -691,7 +1304,7 @@ function buildManagementHtml() {
               <div class="stat"><label>516 占比</label><strong id="reasoning516RatioValue">0.00%</strong></div>
               <div class="stat"><label>当前规则命中总数</label><strong id="matchedCountValue">0</strong></div>
             </div>
-            <p class="footnote">
+            <p class="footnote" id="statsFootnote">
               如果“当前 Codex Base URL”已经是本机监听地址，就说明当前 Codex 已经被这个 gateway 接管。统计口径按本次 gateway 启动以来累计。
             </p>
           </div>
@@ -742,6 +1355,50 @@ function buildManagementHtml() {
             <pre class="log-output" id="logsOutput">正在读取日志...</pre>
           </div>
         </section>
+
+        <section class="card wide-card">
+          <div class="card-inner">
+            <h2>模型家族一致性</h2>
+            <p class="risk-note">
+              本地模型表示本机配置或请求声明；上游模型表示上游自报。声明一致不等于已证明真实运行一致。
+              声明一致率只按拿到上游声明的样本计算，未声明样本不会计入分母。
+              400K 家族异常只表示行为上疑似不符合 1M 家族。单请求模型漂移与疑似请求内重建/重试都按高风险展示，
+              但仍然只能基于响应信号推断，不能直接确认缓存重建。
+            </p>
+            <div class="stats">
+              <div class="stat"><label>声明一致率</label><strong id="modelMatchRatioValue">0.00%</strong></div>
+              <div class="stat"><label>声明不一致次数</label><strong id="modelMismatchCountValue">0</strong></div>
+              <div class="stat"><label>400K 家族异常</label><strong id="lowContextFamilyCountValue">0</strong></div>
+              <div class="stat"><label>单请求模型漂移</label><strong id="modelDriftCountValue">0</strong></div>
+              <div class="stat"><label>指纹漂移次数</label><strong id="fingerprintDriftCountValue">0</strong></div>
+              <div class="stat"><label>疑似请求内重建/重试</label><strong id="rebuildSuspectedCountValue">0</strong></div>
+            </div>
+            <h2 style="margin-top: 18px;">最近可疑样本</h2>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>路径</th>
+                    <th>本地期望</th>
+                    <th>上游声明</th>
+                    <th>流式声明</th>
+                    <th>首个模型</th>
+                    <th>最后模型</th>
+                    <th>模型集合</th>
+                    <th>指纹集合</th>
+                    <th>异常类型</th>
+                    <th>可信度</th>
+                    <th>日志证据</th>
+                  </tr>
+                </thead>
+                <tbody id="suspiciousSamplesBody">
+                  <tr><td colspan="12">暂无数据</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
       </div>
     </div>
 
@@ -768,13 +1425,25 @@ function buildManagementHtml() {
         reasoning516CountValue: document.getElementById('reasoning516CountValue'),
         reasoning516RatioValue: document.getElementById('reasoning516RatioValue'),
         matchedCountValue: document.getElementById('matchedCountValue'),
+        modelMatchRatioValue: document.getElementById('modelMatchRatioValue'),
+        modelMismatchCountValue: document.getElementById('modelMismatchCountValue'),
+        lowContextFamilyCountValue: document.getElementById('lowContextFamilyCountValue'),
+        modelDriftCountValue: document.getElementById('modelDriftCountValue'),
+        fingerprintDriftCountValue: document.getElementById('fingerprintDriftCountValue'),
+        rebuildSuspectedCountValue: document.getElementById('rebuildSuspectedCountValue'),
+        suspiciousSamplesBody: document.getElementById('suspiciousSamplesBody'),
+        statsFootnote: document.getElementById('statsFootnote'),
         logsMeta: document.getElementById('logsMeta'),
         logsOutput: document.getElementById('logsOutput'),
       };
       let hasLoadedForm = false;
       let lastLogSeq = 0;
+      let lastGatewayStartedAt = null;
+      let logsNeedFullReload = false;
       let pollTimer = null;
       let stoppedByRestore = false;
+      let suspiciousSamplesSignature = '';
+      const openEvidenceSampleKeys = new Set();
 
       function setMessage(text, tone) {
         refs.messageBox.textContent = text || '';
@@ -794,6 +1463,37 @@ function buildManagementHtml() {
 
       function formatPercent(value) {
         return Number.isFinite(value) ? (value * 100).toFixed(2) + '%' : '0.00%';
+      }
+
+      function formatPathCounts(pathCounts) {
+        const entries = Object.entries(pathCounts || {})
+          .filter((entry) => Number(entry[1]) > 0)
+          .sort((left, right) => Number(right[1]) - Number(left[1]));
+        if (entries.length === 0) {
+          return '无';
+        }
+        return entries.map((entry) => entry[0] + ' x' + String(entry[1])).join('，');
+      }
+
+      function escapeHtml(value) {
+        return String(value ?? '')
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#39;');
+      }
+
+      function buildSampleKey(sample) {
+        return JSON.stringify({
+          ts: sample?.ts || '',
+          path: sample?.path || '',
+          local: sample?.effective_local_model || '',
+          first: sample?.first_observed_model || '',
+          last: sample?.last_observed_model || '',
+          anomaly: sample?.anomaly_type || '',
+          confidence: sample?.confidence || '',
+        });
       }
 
       function parseReasoningInput() {
@@ -820,15 +1520,50 @@ function buildManagementHtml() {
         refs.configPathValue.textContent = payload.paths?.config_path || '-';
         refs.backupPathValue.textContent = payload.state?.latest_backup_path || '-';
         fillMetrics(payload.metrics || {});
+        fillModelInsights(payload.model_insights || {});
       }
 
       function fillMetrics(metrics) {
+        const totalProxyRequestCount = Number(metrics.total_proxy_request_count ?? 0);
+        const inspectedResponseCount = Number(metrics.inspected_response_count ?? 0);
+        const bypassedProxyRequestCount = Number(metrics.bypassed_proxy_request_count ?? 0);
+        const failedProxyRequestCount = Number(metrics.failed_proxy_request_count ?? 0);
+        const activeProxyRequestCount = Number(metrics.active_proxy_request_count ?? 0);
         refs.startedAtValue.textContent = formatTimestamp(metrics.started_at);
-        refs.proxyRequestCountValue.textContent = String(metrics.total_proxy_request_count ?? 0);
-        refs.inspectedCountValue.textContent = String(metrics.inspected_response_count ?? 0);
+        refs.proxyRequestCountValue.textContent = String(totalProxyRequestCount);
+        refs.inspectedCountValue.textContent = String(inspectedResponseCount);
         refs.reasoning516CountValue.textContent = String(metrics.reasoning_516_count ?? 0);
         refs.reasoning516RatioValue.textContent = formatPercent(metrics.reasoning_516_ratio ?? 0);
         refs.matchedCountValue.textContent = String(metrics.matched_response_count ?? 0);
+        const statsDifference = Math.max(0, totalProxyRequestCount - inspectedResponseCount);
+        const footnoteParts = [
+          '如果“当前 Codex Base URL”已经是本机监听地址，就说明当前 Codex 已经被这个 gateway 接管。统计口径按本次 gateway 启动以来累计。',
+          '代理请求总数 = 被检查响应总数 + 未纳入检查的透传请求 + 失败请求 + 进行中的代理请求。',
+        ];
+        if (
+          statsDifference > 0 ||
+          bypassedProxyRequestCount > 0 ||
+          failedProxyRequestCount > 0 ||
+          activeProxyRequestCount > 0
+        ) {
+          footnoteParts.push(
+            '当前差值 ' +
+              String(statsDifference) +
+              '，其中未纳入检查的透传请求 ' +
+              String(bypassedProxyRequestCount) +
+              '（' +
+              formatPathCounts(metrics.bypassed_proxy_path_counts) +
+              '），失败请求 ' +
+              String(failedProxyRequestCount) +
+              '，进行中的代理请求 ' +
+              String(activeProxyRequestCount) +
+              '（' +
+              formatPathCounts(metrics.active_proxy_path_counts) +
+              '）' +
+              '。',
+          );
+        }
+        refs.statsFootnote.textContent = footnoteParts.join(' ');
       }
 
       function fillForm(config) {
@@ -838,11 +1573,86 @@ function buildManagementHtml() {
         refs.logMatchInput.checked = Boolean(config?.log_match);
       }
 
+      function renderEvidenceLogs(evidenceLogs, sampleKey, isOpen) {
+        const entries = Array.isArray(evidenceLogs) ? evidenceLogs : [];
+        if (entries.length === 0) {
+          return '-';
+        }
+        const lines = entries
+          .map((entry) => {
+            const prefix = entry?.seq ? '#' + entry.seq + ' ' : '';
+            const at = entry?.at ? formatTimestamp(entry.at) : '-';
+            const message = entry?.message ? entry.message : '';
+            return prefix + at + ' ' + message;
+          })
+          .join('\\n');
+        return '<details class="evidence-details" data-sample-key="' +
+          escapeHtml(sampleKey) +
+          '"' +
+          (isOpen ? ' open' : '') +
+          '><summary>查看 ' +
+          String(entries.length) +
+          ' 条</summary><pre class="evidence-log-output">' +
+          escapeHtml(lines) +
+          '</pre></details>';
+      }
+
+      function renderSuspiciousSamples(samples) {
+        const rows = Array.isArray(samples) ? samples : [];
+        const signature = JSON.stringify(rows);
+        if (signature === suspiciousSamplesSignature) {
+          return;
+        }
+
+        const validKeys = new Set(rows.map((sample) => buildSampleKey(sample)));
+        openEvidenceSampleKeys.forEach((key) => {
+          if (!validKeys.has(key)) {
+            openEvidenceSampleKeys.delete(key);
+          }
+        });
+
+        if (rows.length === 0) {
+          refs.suspiciousSamplesBody.innerHTML = '<tr><td colspan="12">暂无数据</td></tr>';
+          suspiciousSamplesSignature = signature;
+          return;
+        }
+        refs.suspiciousSamplesBody.innerHTML = rows
+          .map((sample) => {
+            const sampleKey = buildSampleKey(sample);
+            return '<tr>' +
+            '<td>' + formatTimestamp(sample.ts) + '</td>' +
+            '<td>' + (sample.path || '-') + '</td>' +
+            '<td>' + (sample.effective_local_model || '-') + '</td>' +
+            '<td>' + (sample.upstream_model || '-') + '</td>' +
+            '<td>' + (sample.stream_model || '-') + '</td>' +
+            '<td>' + (sample.first_observed_model || '-') + '</td>' +
+            '<td>' + (sample.last_observed_model || '-') + '</td>' +
+            '<td>' + ((sample.observed_models || []).join(', ') || '-') + '</td>' +
+            '<td>' + ((sample.observed_fingerprints || []).join(', ') || '-') + '</td>' +
+            '<td>' + (sample.anomaly_type || '-') + '</td>' +
+            '<td>' + (sample.confidence || '-') + '</td>' +
+            '<td>' + renderEvidenceLogs(sample.evidence_logs, sampleKey, openEvidenceSampleKeys.has(sampleKey)) + '</td>' +
+          '</tr>';
+          })
+          .join('');
+        suspiciousSamplesSignature = signature;
+      }
+
+      function fillModelInsights(modelInsights) {
+        refs.modelMatchRatioValue.textContent = formatPercent(modelInsights?.consistency?.match_ratio ?? 0);
+        refs.modelMismatchCountValue.textContent = String(modelInsights?.consistency?.mismatched ?? 0);
+        refs.lowContextFamilyCountValue.textContent = String(modelInsights?.anomalies?.low_context_family_count ?? 0);
+        refs.modelDriftCountValue.textContent = String(modelInsights?.single_request_anomalies?.model_drift_count ?? 0);
+        refs.fingerprintDriftCountValue.textContent = String(modelInsights?.single_request_anomalies?.fingerprint_drift_count ?? 0);
+        refs.rebuildSuspectedCountValue.textContent = String(modelInsights?.single_request_anomalies?.rebuild_suspected_count ?? 0);
+        renderSuspiciousSamples(modelInsights?.suspicious_samples || []);
+      }
+
       function renderLogs(payload, replaceAll) {
         const entries = Array.isArray(payload?.entries) ? payload.entries : [];
         const rendered = entries
           .map((entry) => {
-            const at = entry?.at ? entry.at : '-';
+            const at = entry?.at ? formatTimestamp(entry.at) : '-';
             const message = entry?.message ? entry.message : '';
             return at + ' ' + message;
           })
@@ -872,8 +1682,10 @@ function buildManagementHtml() {
       }
 
       async function loadLogs(incremental) {
+        const shouldReplaceAll = !incremental || lastLogSeq === 0 || logsNeedFullReload;
         const url = new URL(ui.logsPath, window.location.origin);
-        if (incremental && lastLogSeq > 0) {
+        const requestedSinceSeq = shouldReplaceAll ? null : lastLogSeq;
+        if (requestedSinceSeq !== null) {
           url.searchParams.set('since_seq', String(lastLogSeq));
         }
         const response = await fetch(url.toString(), { cache: 'no-store' });
@@ -881,16 +1693,33 @@ function buildManagementHtml() {
         if (!response.ok) {
           throw new Error(payload?.error?.message || '读取日志失败');
         }
-        renderLogs(payload, !incremental || lastLogSeq === 0);
+        if (
+          requestedSinceSeq !== null &&
+          Number.isInteger(payload?.latest_seq) &&
+          payload.latest_seq < requestedSinceSeq
+        ) {
+          lastLogSeq = 0;
+          logsNeedFullReload = false;
+          await loadLogs(false);
+          return;
+        }
+        renderLogs(payload, shouldReplaceAll);
+        logsNeedFullReload = false;
       }
 
       async function loadStatus(options) {
         const refreshForm = Boolean(options?.refreshForm);
-        const response = await fetch(ui.statusPath);
+        const response = await fetch(ui.statusPath, { cache: 'no-store' });
         const payload = await response.json();
         if (!response.ok) {
           throw new Error(payload?.error?.message || '读取状态失败');
         }
+        const nextStartedAt = payload.metrics?.started_at || null;
+        if (lastGatewayStartedAt && nextStartedAt && nextStartedAt !== lastGatewayStartedAt) {
+          logsNeedFullReload = true;
+          lastLogSeq = 0;
+        }
+        lastGatewayStartedAt = nextStartedAt;
         fillStatus(payload);
         if (refreshForm || !hasLoadedForm) {
           fillForm(payload.config || {});
@@ -972,19 +1801,30 @@ function buildManagementHtml() {
         if (stoppedByRestore) {
           return;
         }
-        await Promise.all([
-          loadStatus({ refreshForm: false }),
-          loadLogs(true),
-        ]);
+        await loadStatus({ refreshForm: false });
+        await loadLogs(true);
       }
 
       refs.form.addEventListener('submit', saveConfig);
       refs.restoreButton.addEventListener('click', restoreConfig);
+      refs.suspiciousSamplesBody.addEventListener('toggle', (event) => {
+        const details = event.target;
+        if (!details || details.tagName !== 'DETAILS' || !details.classList.contains('evidence-details')) {
+          return;
+        }
+        const sampleKey = details.getAttribute('data-sample-key');
+        if (!sampleKey) {
+          return;
+        }
+        if (details.open) {
+          openEvidenceSampleKeys.add(sampleKey);
+        } else {
+          openEvidenceSampleKeys.delete(sampleKey);
+        }
+      });
 
-      Promise.all([
-        loadStatus({ refreshForm: true }),
-        loadLogs(false),
-      ])
+      loadStatus({ refreshForm: true })
+        .then(() => loadLogs(false))
         .then(() => {
           pollTimer = window.setInterval(() => {
             refreshLiveData().catch((error) => {
@@ -1005,6 +1845,12 @@ function buildManagementHtml() {
 async function handleManagementRequest(runtime, req, res, requestUrl) {
   const pathname = normalizePath(requestUrl.pathname);
 
+  if (pathname === FAVICON_PATH) {
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+
   if (pathname === UI_PATH) {
     htmlResponse(res, buildManagementHtml());
     return true;
@@ -1012,6 +1858,7 @@ async function handleManagementRequest(runtime, req, res, requestUrl) {
 
   if (pathname === STATUS_API_PATH && req.method === "GET") {
     const state = await readRuntimeState(runtime);
+    await getLocalConfigModel(runtime);
     jsonResponse(res, 200, {
       ok: true,
       listen: `${runtime.config.listen_host}:${runtime.config.listen_port}`,
@@ -1024,6 +1871,7 @@ async function handleManagementRequest(runtime, req, res, requestUrl) {
         log_path: runtime.logPath,
       },
       metrics: buildMetricsSnapshot(runtime.monitor),
+      model_insights: buildModelInsightsSnapshot(runtime),
     });
     return true;
   }
@@ -1070,6 +1918,7 @@ async function handleManagementRequest(runtime, req, res, requestUrl) {
         log_path: runtime.logPath,
       },
       metrics: buildMetricsSnapshot(runtime.monitor),
+      model_insights: buildModelInsightsSnapshot(runtime),
     });
     return true;
   }
@@ -1245,39 +2094,15 @@ async function fetchUpstreamWithRetry(upstreamUrl, init, logger) {
 }
 
 function inspectSseChunk(state, chunk) {
-  const decoded = state.decoder.decode(chunk, { stream: true });
-  state.buffer += decoded;
-
-  const blocks = state.buffer.split(/\r?\n\r?\n/);
-  state.buffer = blocks.pop() ?? "";
-
-  for (const block of blocks) {
-    const lines = block
-      .split(/\r?\n/)
-      .map((line) => line.trimEnd())
-      .filter(Boolean);
-    const dataLines = lines
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.replace(/^data:\s?/, ""));
-
-    if (dataLines.length === 0) {
-      continue;
-    }
-    const payloadText = dataLines.join("\n");
-    if (payloadText === "[DONE]") {
-      continue;
-    }
-    try {
-      const parsed = JSON.parse(payloadText);
-      const reasoning = extractReasoningTokens(parsed);
-      if (reasoning !== null) {
-        return reasoning;
-      }
-    } catch {
-      // ignore malformed SSE payloads
+  const payloads = parseSsePayloads(state, chunk);
+  let reasoning = null;
+  for (const payload of payloads) {
+    const extracted = extractReasoningTokens(payload);
+    if (extracted !== null) {
+      reasoning = extracted;
     }
   }
-  return null;
+  return { reasoning, payloads };
 }
 
 async function handleNonStreaming({
@@ -1285,6 +2110,8 @@ async function handleNonStreaming({
   logger,
   monitor,
   pathname,
+  requestTracking,
+  modelContext,
   upstreamResponse,
   res,
 }) {
@@ -1292,10 +2119,15 @@ async function handleNonStreaming({
   const parsed = isJsonContentType(upstreamResponse.headers.get("content-type"))
     ? parseJsonSafely(bodyBuffer)
     : null;
+  if (parsed) {
+    applyPayloadModelSignals(modelContext, parsed, { fromFinalResponse: true });
+    modelContext.upstreamModel = modelContext.upstreamModel || modelContext.finalResponseModel;
+  }
   const reasoning = parsed ? extractReasoningTokens(parsed) : null;
   const matched = reasoningMatched(config, reasoning);
 
   recordInspectedResponse(monitor, reasoning, matched);
+  setRequestTrackingOutcome(requestTracking, "inspected");
 
   if (matched) {
     if (config.log_match) {
@@ -1312,6 +2144,12 @@ async function handleNonStreaming({
     return;
   }
 
+  finalizeModelInsights(
+    monitor,
+    pathname,
+    modelContext,
+    upstreamResponse.status >= 400 ? parsed : null,
+  );
   copyHeadersToClient(upstreamResponse.headers, res);
   res.writeHead(upstreamResponse.status);
   res.end(bodyBuffer);
@@ -1322,6 +2160,8 @@ async function handleStreaming({
   logger,
   monitor,
   pathname,
+  requestTracking,
+  modelContext,
   upstreamResponse,
   res,
   abortController,
@@ -1349,6 +2189,8 @@ async function handleStreaming({
     } catch (error) {
       if (isExpectedStreamTermination(error)) {
         recordInspectedResponse(monitor, observedReasoning, false);
+        setRequestTrackingOutcome(requestTracking, "inspected");
+        finalizeModelInsights(monitor, pathname, modelContext);
         if (strict502Mode) {
           logger?.(`[stream] upstream terminated before completion path=${pathname} action=status_502`);
           res.writeHead(502, { "content-type": "application/json; charset=utf-8" });
@@ -1364,6 +2206,8 @@ async function handleStreaming({
     const { done, value } = readResult;
     if (done) {
       recordInspectedResponse(monitor, observedReasoning, false);
+      setRequestTrackingOutcome(requestTracking, "inspected");
+      finalizeModelInsights(monitor, pathname, modelContext);
       if (strict502Mode) {
         copyHeadersToClient(upstreamResponse.headers, res);
         res.writeHead(upstreamResponse.status);
@@ -1375,12 +2219,19 @@ async function handleStreaming({
     }
 
     const chunkBuffer = Buffer.from(value);
-    const reasoning = inspectSseChunk(sseState, value);
+    const { reasoning, payloads } = inspectSseChunk(sseState, value);
+    for (const payload of payloads) {
+      applyPayloadModelSignals(modelContext, payload, {
+        fromStream: true,
+        fromFinalResponse: payload?.type === "response.completed",
+      });
+    }
     if (Number.isInteger(reasoning)) {
       observedReasoning = reasoning;
     }
     if (reasoningMatched(config, reasoning)) {
       recordInspectedResponse(monitor, reasoning, true);
+      setRequestTrackingOutcome(requestTracking, "inspected");
       if (config.log_match) {
         logger(
           `[match] stream path=${pathname} reasoning_tokens=${reasoning} action=${config.stream_action}`,
@@ -1396,10 +2247,12 @@ async function handleStreaming({
           "x-codex-retry-gateway-reason": "reasoning-guard-triggered",
         });
         res.end(blockedBody);
+        finalizeModelInsights(monitor, pathname, modelContext);
       } else {
         abortController.abort();
         reader.cancel().catch(() => {});
         res.socket?.destroy();
+        finalizeModelInsights(monitor, pathname, modelContext);
       }
       return;
     }
@@ -1418,6 +2271,10 @@ async function proxyRequest(runtime, req, res) {
   const config = runtime.config;
   const incomingUrl = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
   const pathname = normalizePath(incomingUrl.pathname);
+  const requestTracking = {
+    outcome: null,
+    req,
+  };
 
   if (pathname === config.health_path) {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
@@ -1436,57 +2293,85 @@ async function proxyRequest(runtime, req, res) {
     return;
   }
 
+  req.__codexRetryGatewayProxyTracked = true;
   runtime.monitor.total_proxy_request_count += 1;
+  recordActiveProxyRequestStart(runtime.monitor, pathname);
 
-  const requestBody = await readRequestBody(req, config.request_body_limit_bytes);
-  const requestJson = isJsonContentType(req.headers["content-type"])
-    ? parseJsonSafely(requestBody)
-    : null;
-  const requestIsStream = Boolean(requestJson?.stream);
+  try {
+    const requestBody = await readRequestBody(req, config.request_body_limit_bytes);
+    const requestJson = isJsonContentType(req.headers["content-type"])
+      ? parseJsonSafely(requestBody)
+      : null;
+    const localConfigModel = await getLocalConfigModel(runtime);
+    const modelContext = createRequestModelContext(localConfigModel, requestJson?.model ?? null);
+    const requestIsStream = Boolean(requestJson?.stream);
 
-  const upstreamUrl = buildUpstreamUrl(config.upstream_base_url, incomingUrl);
-  const abortController = new AbortController();
+    const upstreamUrl = buildUpstreamUrl(config.upstream_base_url, incomingUrl);
+    const abortController = new AbortController();
 
-  const upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, {
-    method: req.method,
-    headers: cloneHeadersForUpstream(req.headers),
-    body: requestBody.length > 0 ? requestBody : undefined,
-    signal: abortController.signal,
-  }, logger);
+    const upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, {
+      method: req.method,
+      headers: cloneHeadersForUpstream(req.headers),
+      body: requestBody.length > 0 ? requestBody : undefined,
+      signal: abortController.signal,
+    }, logger);
 
-  const shouldInspect = matchPath(config, pathname);
-  const responseIsStream =
-    requestIsStream || isSseContentType(upstreamResponse.headers.get("content-type"));
+    const shouldInspect = matchPath(config, pathname);
+    const responseIsStream =
+      requestIsStream || isSseContentType(upstreamResponse.headers.get("content-type"));
 
-  if (!shouldInspect) {
-    copyHeadersToClient(upstreamResponse.headers, res);
-    res.writeHead(upstreamResponse.status);
-    const body = Buffer.from(await upstreamResponse.arrayBuffer());
-    res.end(body);
-    return;
-  }
+    if (!shouldInspect) {
+      const body = Buffer.from(await upstreamResponse.arrayBuffer());
+      if (isJsonContentType(upstreamResponse.headers.get("content-type"))) {
+        const parsed = parseJsonSafely(body);
+        if (parsed) {
+          applyPayloadModelSignals(modelContext, parsed, { fromFinalResponse: true });
+        }
+      }
+      finalizeModelInsights(
+        runtime.monitor,
+        pathname,
+        modelContext,
+        upstreamResponse.status >= 400 && isJsonContentType(upstreamResponse.headers.get("content-type"))
+          ? parseJsonSafely(body)
+          : null,
+      );
+      copyHeadersToClient(upstreamResponse.headers, res);
+      res.writeHead(upstreamResponse.status);
+      res.end(body);
+      recordBypassedProxyRequest(runtime.monitor, pathname);
+      setRequestTrackingOutcome(requestTracking, "bypassed");
+      return;
+    }
 
-  if (responseIsStream) {
-    await handleStreaming({
+    if (responseIsStream) {
+      await handleStreaming({
+        config,
+        logger,
+        monitor: runtime.monitor,
+        pathname,
+        requestTracking,
+        modelContext,
+        upstreamResponse,
+        res,
+        abortController,
+      });
+      return;
+    }
+
+    await handleNonStreaming({
       config,
       logger,
       monitor: runtime.monitor,
       pathname,
+      requestTracking,
+      modelContext,
       upstreamResponse,
       res,
-      abortController,
     });
-    return;
+  } finally {
+    recordActiveProxyRequestEnd(runtime.monitor, pathname);
   }
-
-  await handleNonStreaming({
-    config,
-    logger,
-    monitor: runtime.monitor,
-    pathname,
-    upstreamResponse,
-    res,
-  });
 }
 
 async function main() {
@@ -1506,6 +2391,7 @@ async function main() {
     logger,
     monitor,
     paths: buildRuntimePaths(configPath, args.log || null),
+    localConfigModelCache: null,
     server: null,
   };
 
@@ -1513,6 +2399,9 @@ async function main() {
     try {
       await proxyRequest(runtime, req, res);
     } catch (error) {
+      if (req.__codexRetryGatewayProxyTracked && !req.__codexRetryGatewayProxyOutcome) {
+        runtime.monitor.failed_proxy_request_count += 1;
+      }
       logger(`[error] ${error?.stack || error}`);
       if (!res.headersSent) {
         res.writeHead(502, { "content-type": "application/json; charset=utf-8" });
