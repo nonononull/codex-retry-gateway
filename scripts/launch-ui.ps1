@@ -77,6 +77,9 @@ if (-not $canReuseExistingInstall) {
     if ($null -eq $existingGatewayConfig.PSObject.Properties["intercept_non_streaming"]) {
       $existingGatewayConfig | Add-Member -NotePropertyName "intercept_non_streaming" -NotePropertyValue $true
     }
+    if ($null -eq $existingGatewayConfig.PSObject.Properties["guard_retry_attempts"]) {
+      $existingGatewayConfig | Add-Member -NotePropertyName "guard_retry_attempts" -NotePropertyValue 3
+    }
     if ((-not [bool]$existingGatewayConfig.intercept_streaming) -and (-not [bool]$existingGatewayConfig.intercept_non_streaming)) {
       $existingGatewayConfig.intercept_streaming = $true
       $existingGatewayConfig.intercept_non_streaming = $true

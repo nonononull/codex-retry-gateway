@@ -340,6 +340,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     "interceptModeValue",
     "endpointsInput",
     "statusCodeInput",
+    "guardRetryAttemptsInput",
     "logMatchInput",
     "probeTargetFamily54Input",
     "probeTargetFamily55Input",
@@ -388,6 +389,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     ids.map((id) => [id, new FakeElement(id === "configForm" ? "form" : "div")]),
   );
   elements.statusCodeInput.value = "502";
+  elements.guardRetryAttemptsInput.value = "3";
 
   const statusPayload = {
     listen: "http://127.0.0.1:4610",
@@ -398,6 +400,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
       intercept_non_streaming: true,
       endpoints: ["/responses"],
       non_stream_status_code: 502,
+      guard_retry_attempts: 3,
       log_match: true,
       active_probe: {
         enabled: true,
@@ -643,6 +646,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   assert(elements.probeIntervalMinutesInput.value === "10", "主动探针未回填分钟频率");
   assert(elements.interceptStreamingInput.checked === true, "管理页未回填流式拦截开关");
   assert(elements.interceptNonStreamingInput.checked === true, "管理页未回填非流式拦截开关");
+  assert(elements.guardRetryAttemptsInput.value === "3", "管理页未回填网关内重试次数");
   assert(
     elements.interceptModeValue.textContent.includes("流式+非流式"),
     "管理页未显示双开拦截模式",
@@ -731,6 +735,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   const savedPayload = JSON.parse(saveConfigCall.body);
   assert(savedPayload.intercept_streaming === true, "saveConfig 未提交 intercept_streaming");
   assert(savedPayload.intercept_non_streaming === false, "saveConfig 未提交 intercept_non_streaming");
+  assert(savedPayload.guard_retry_attempts === 3, "saveConfig 未提交 guard_retry_attempts");
   assert(savedPayload.active_probe, "saveConfig 未提交 active_probe");
   assert(savedPayload.active_probe.enabled === false, "saveConfig 未提交 active_probe.enabled");
   assert(
@@ -1034,6 +1039,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
 
 function startFakeUpstream(port) {
   const failBeforeResponseCounts = new Map();
+  const reasoningSequenceCounts = new Map();
   const identityProbeCounts = new Map();
   const probeRequests = [];
   const responseRequests = [];
@@ -1068,7 +1074,17 @@ function startFakeUpstream(port) {
         const parsed = JSON.parse(body || "{}");
         const authorization = req.headers.authorization || "";
         const probeBlockedByUpstream = authorization === "Bearer sk-probe-blocked";
-        const reasoning = parsed.test_reasoning_tokens ?? 128;
+        const sequenceKey =
+          Array.isArray(parsed.test_reasoning_sequence)
+            ? `${req.url}:${parsed.test_sequence_key || JSON.stringify(parsed.test_reasoning_sequence)}`
+            : null;
+        const sequenceCount = sequenceKey ? reasoningSequenceCounts.get(sequenceKey) || 0 : 0;
+        if (sequenceKey) {
+          reasoningSequenceCounts.set(sequenceKey, sequenceCount + 1);
+        }
+        const reasoning = sequenceKey
+          ? parsed.test_reasoning_sequence[Math.min(sequenceCount, parsed.test_reasoning_sequence.length - 1)]
+          : parsed.test_reasoning_tokens ?? 128;
         const serializedInput = JSON.stringify(parsed.input || "");
         const requestSnapshot = {
           path: req.url,
@@ -1400,7 +1416,17 @@ function startFakeUpstream(port) {
       });
       req.on("end", () => {
         const parsed = JSON.parse(body || "{}");
-        const reasoning = parsed.test_reasoning_tokens ?? 128;
+        const sequenceKey =
+          Array.isArray(parsed.test_reasoning_sequence)
+            ? `${req.url}:${parsed.test_sequence_key || JSON.stringify(parsed.test_reasoning_sequence)}`
+            : null;
+        const sequenceCount = sequenceKey ? reasoningSequenceCounts.get(sequenceKey) || 0 : 0;
+        if (sequenceKey) {
+          reasoningSequenceCounts.set(sequenceKey, sequenceCount + 1);
+        }
+        const reasoning = sequenceKey
+          ? parsed.test_reasoning_sequence[Math.min(sequenceCount, parsed.test_reasoning_sequence.length - 1)]
+          : parsed.test_reasoning_tokens ?? 128;
         if (reasoning === 516) {
           createSseResponse(
             res,
@@ -1580,6 +1606,7 @@ async function run() {
     ).then((response) => response.json());
     assert(statusBeforeUiRefresh.config?.intercept_streaming === true, "intercept_streaming 默认应开启");
     assert(statusBeforeUiRefresh.config?.intercept_non_streaming === true, "intercept_non_streaming 默认应开启");
+    assert(statusBeforeUiRefresh.config?.guard_retry_attempts === 3, "guard_retry_attempts 默认应为 3");
     assert(statusBeforeUiRefresh.active_probe, "status 缺少 active_probe");
     assert(statusBeforeUiRefresh.active_probe.enabled === false, "active_probe 默认应关闭");
     assert(statusBeforeUiRefresh.active_probe.running === false, "active_probe 初始不应处于运行中");
@@ -1626,6 +1653,15 @@ async function run() {
     assert(uiHtml.includes('id="interceptStreamingInput"'), "管理页缺少流式拦截复选框");
     assert(uiHtml.includes('id="interceptNonStreamingInput"'), "管理页缺少非流式拦截复选框");
     assert(uiHtml.includes('id="interceptModeValue"'), "管理页缺少当前拦截模式展示");
+    assert(uiHtml.includes('id="guardRetryAttemptsInput"'), "管理页缺少网关内重试次数输入框");
+    assert(uiHtml.includes("网关内重试次数"), "管理页缺少网关内重试次数标签");
+    assert(uiHtml.includes("TG群："), "管理页缺少 TG 群入口文案");
+    assert(uiHtml.includes('href="https://t.me/AI_INPUT_IM"'), "管理页缺少 TG 群链接");
+    assert(
+      uiHtml.indexOf('name="non_stream_status_code"') < uiHtml.indexOf('name="guard_retry_attempts"') &&
+        uiHtml.indexOf('name="guard_retry_attempts"') < uiHtml.indexOf('name="log_match"'),
+      "网关内重试次数应位于 non_stream_status_code 与 log_match 之间",
+    );
     assert(!uiHtml.includes("516 命中次数"), "管理页不应再显示 516 命中次数卡片");
     assert(!uiHtml.includes("516 占比"), "管理页不应再显示 516 占比卡片");
     assert(uiHtml.includes("当前规则命中总数"), "管理页缺少当前规则命中总数卡片");
@@ -1752,11 +1788,11 @@ async function run() {
       `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
     ).then((response) => response.json());
     assert(
-      defaultModeStatus.metrics.matched_non_streaming_count === 2,
+      defaultModeStatus.metrics.matched_non_streaming_count === 8,
       `双开默认模式下非流式命中次数不正确: ${defaultModeStatus.metrics.matched_non_streaming_count}`,
     );
     assert(
-      defaultModeStatus.metrics.blocked_non_streaming_count === 2,
+      defaultModeStatus.metrics.blocked_non_streaming_count === 8,
       `双开默认模式下非流式拦截次数不正确: ${defaultModeStatus.metrics.blocked_non_streaming_count}`,
     );
 
@@ -1815,11 +1851,11 @@ async function run() {
       `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
     ).then((response) => response.json());
     assert(
-      statusAfterStreamOnlyNonStream.metrics.matched_non_streaming_count === 3,
+      statusAfterStreamOnlyNonStream.metrics.matched_non_streaming_count === 9,
       `仅流式模式下非流式命中仍应计数: ${statusAfterStreamOnlyNonStream.metrics.matched_non_streaming_count}`,
     );
     assert(
-      statusAfterStreamOnlyNonStream.metrics.blocked_non_streaming_count === 2,
+      statusAfterStreamOnlyNonStream.metrics.blocked_non_streaming_count === 8,
       `仅流式模式下非流式透传不应增加拦截数: ${statusAfterStreamOnlyNonStream.metrics.blocked_non_streaming_count}`,
     );
     assert(
@@ -1887,6 +1923,338 @@ async function run() {
       },
     );
     assert(bothModeConfigResponse.status === 200, `恢复双开拦截失败: ${bothModeConfigResponse.status}`);
+
+    const zeroGuardRetryConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          guard_retry_attempts: 0,
+        }),
+      },
+    );
+    assert(
+      zeroGuardRetryConfigResponse.status === 200,
+      `guard_retry_attempts=0 应保存成功: ${zeroGuardRetryConfigResponse.status}`,
+    );
+    const zeroGuardRetryStatus = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    assert(
+      zeroGuardRetryStatus.config?.guard_retry_attempts === 0,
+      "guard_retry_attempts=0 未在状态接口生效",
+    );
+    const zeroRetryKey = "non-stream-zero-retry-516";
+    const zeroRetryResponse = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        test_sequence_key: zeroRetryKey,
+        test_reasoning_sequence: [516],
+      }),
+    });
+    const zeroRetryBody = await zeroRetryResponse.json();
+    assert(
+      zeroRetryResponse.status === 502,
+      `guard_retry_attempts=0 命中规则应直接返回 502: ${zeroRetryResponse.status}`,
+    );
+    assert(
+      zeroRetryBody?.error?.code === "reasoning_guard_triggered",
+      "guard_retry_attempts=0 命中规则返回体不正确",
+    );
+    assert(
+      upstream.responseRequests.filter((entry) => entry.body?.test_sequence_key === zeroRetryKey).length === 1,
+      "guard_retry_attempts=0 命中规则不应触发内部重试",
+    );
+    const zeroRetryLogs = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/logs`,
+    ).then((response) => response.json());
+    assert(
+      zeroRetryLogs.entries.some((entry) =>
+        `${entry.message || ""}`.includes(
+          "[match] non-stream path=/responses reasoning_tokens=516 action=return_status_502",
+        ),
+      ),
+      "guard_retry_attempts=0 命中规则日志应标记为 return_status_502",
+    );
+    const negativeGuardRetryConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          guard_retry_attempts: -1,
+        }),
+      },
+    );
+    assert(
+      negativeGuardRetryConfigResponse.status === 400,
+      `guard_retry_attempts=-1 应被拒绝: ${negativeGuardRetryConfigResponse.status}`,
+    );
+    const invalidGuardRetryConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          guard_retry_attempts: "abc",
+        }),
+      },
+    );
+    assert(
+      invalidGuardRetryConfigResponse.status === 400,
+      `guard_retry_attempts=abc 应被拒绝: ${invalidGuardRetryConfigResponse.status}`,
+    );
+    const oneGuardRetryConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          guard_retry_attempts: 1,
+        }),
+      },
+    );
+    assert(
+      oneGuardRetryConfigResponse.status === 200,
+      `guard_retry_attempts=1 应保存成功: ${oneGuardRetryConfigResponse.status}`,
+    );
+
+    const statusBeforeGuardRetry = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    const nonStreamRetryKey = "non-stream-516-then-128";
+    const nonStreamRetryResponse = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.4",
+        test_response_model: "gpt-5.4",
+        test_sequence_key: nonStreamRetryKey,
+        test_reasoning_sequence: [516, 128],
+      }),
+    });
+    const nonStreamRetryBody = await nonStreamRetryResponse.json();
+    assert(
+      nonStreamRetryResponse.status === 200,
+      `非流式命中后应由网关内部重试恢复为 200: ${nonStreamRetryResponse.status}`,
+    );
+    assert(
+      nonStreamRetryBody?.usage?.output_tokens_details?.reasoning_tokens === 128,
+      "非流式命中后内部重试未返回第二次正常响应",
+    );
+    assert(
+      upstream.responseRequests.filter((entry) => entry.body?.test_sequence_key === nonStreamRetryKey).length === 2,
+      "非流式命中后内部重试应向上游请求 2 次",
+    );
+    const nonStreamRetryLogs = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/logs`,
+    ).then((response) => response.json());
+    assert(
+      nonStreamRetryLogs.entries.some((entry) =>
+        `${entry.message || ""}`.includes(
+          "[match] non-stream path=/responses reasoning_tokens=516 action=internal_retry remaining=1",
+        ),
+      ),
+      "非流式内部重试日志应标记为 internal_retry",
+    );
+    const statusAfterNonStreamGuardRetry = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    assert(
+      statusAfterNonStreamGuardRetry.metrics.total_proxy_request_count ===
+        statusBeforeGuardRetry.metrics.total_proxy_request_count + 2,
+      "非流式内部重试应按每次上游尝试计入代理请求总数",
+    );
+    assert(
+      statusAfterNonStreamGuardRetry.metrics.inspected_response_count ===
+        statusBeforeGuardRetry.metrics.inspected_response_count + 2,
+      "非流式内部重试应按每次响应计入被检查响应总数",
+    );
+    assert(
+      statusAfterNonStreamGuardRetry.metrics.matched_response_count ===
+        statusBeforeGuardRetry.metrics.matched_response_count + 1,
+      "非流式内部重试首次命中应计入当前规则命中总数",
+    );
+    assert(
+      statusAfterNonStreamGuardRetry.metrics.blocked_response_count ===
+        statusBeforeGuardRetry.metrics.blocked_response_count + 1,
+      "非流式内部重试首次吞掉响应应计入实际拦截总数",
+    );
+    assert(
+      statusAfterNonStreamGuardRetry.metrics.matched_non_streaming_count ===
+        statusBeforeGuardRetry.metrics.matched_non_streaming_count + 1,
+      "非流式内部重试首次命中应计入非流式命中次数",
+    );
+    assert(
+      statusAfterNonStreamGuardRetry.metrics.blocked_non_streaming_count ===
+        statusBeforeGuardRetry.metrics.blocked_non_streaming_count + 1,
+      "非流式内部重试首次吞掉响应应计入非流式拦截次数",
+    );
+
+    const upstreamErrorKey = "real-upstream-429";
+    const upstreamErrorResponse = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        test_sequence_key: upstreamErrorKey,
+        test_error_status: 429,
+        test_error_payload: {
+          error: {
+            type: "rate_limit_error",
+            message: "too many requests",
+          },
+        },
+      }),
+    });
+    const upstreamErrorBody = await upstreamErrorResponse.json();
+    assert(upstreamErrorResponse.status === 429, `上游真实 429 应透传: ${upstreamErrorResponse.status}`);
+    assert(upstreamErrorBody?.error?.type === "rate_limit_error", "上游真实 429 响应体应透传");
+    assert(
+      upstream.responseRequests.filter((entry) => entry.body?.test_sequence_key === upstreamErrorKey).length === 1,
+      "上游真实 429 不应触发规则内部重试",
+    );
+
+    const statusBeforeExceededGuardRetry = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    const exceededRetryKey = "non-stream-516-then-516";
+    const exceededRetryResponse = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        test_sequence_key: exceededRetryKey,
+        test_reasoning_sequence: [516, 516],
+      }),
+    });
+    const exceededRetryBody = await exceededRetryResponse.json();
+    assert(
+      exceededRetryResponse.status === 502,
+      `非流式连续命中超过上限后应返回拦截状态: ${exceededRetryResponse.status}`,
+    );
+    assert(
+      exceededRetryBody?.error?.code === "reasoning_guard_triggered",
+      "非流式连续命中超过上限后返回体不正确",
+    );
+    assert(
+      upstream.responseRequests.filter((entry) => entry.body?.test_sequence_key === exceededRetryKey).length === 2,
+      "非流式连续命中超过上限时应只请求 2 次上游",
+    );
+    const exceededRetryLogs = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/logs`,
+    ).then((response) => response.json());
+    assert(
+      exceededRetryLogs.entries.some((entry) =>
+        `${entry.message || ""}`.includes(
+          "[match] non-stream path=/responses reasoning_tokens=516 action=internal_retry remaining=1",
+        ),
+      ),
+      "非流式连续命中超过上限的第一次命中日志应标记为 internal_retry",
+    );
+    assert(
+      exceededRetryLogs.entries.some((entry) =>
+        `${entry.message || ""}`.includes(
+          "[match] non-stream path=/responses reasoning_tokens=516 action=return_status_502",
+        ),
+      ),
+      "非流式连续命中超过上限的最终命中日志应标记为 return_status_502",
+    );
+    const statusAfterExceededGuardRetry = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    assert(
+      statusAfterExceededGuardRetry.metrics.total_proxy_request_count ===
+        statusBeforeExceededGuardRetry.metrics.total_proxy_request_count + 2,
+      "非流式连续命中超过上限时代理请求总数应增加 2",
+    );
+    assert(
+      statusAfterExceededGuardRetry.metrics.inspected_response_count ===
+        statusBeforeExceededGuardRetry.metrics.inspected_response_count + 2,
+      "非流式连续命中超过上限时被检查响应总数应增加 2",
+    );
+    assert(
+      statusAfterExceededGuardRetry.metrics.matched_response_count ===
+        statusBeforeExceededGuardRetry.metrics.matched_response_count + 2,
+      "非流式连续命中超过上限时规则命中总数应增加 2",
+    );
+    assert(
+      statusAfterExceededGuardRetry.metrics.blocked_response_count ===
+        statusBeforeExceededGuardRetry.metrics.blocked_response_count + 2,
+      "非流式连续命中超过上限时实际拦截总数应增加 2",
+    );
+
+    const statusBeforeStreamGuardRetry = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    const streamRetryKey = "stream-516-then-128";
+    const streamRetryResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: streamRetryKey,
+        test_reasoning_sequence: [516, 128],
+      },
+    );
+    assert(
+      streamRetryResponse.status === 200,
+      `流式命中后应由网关内部重试恢复为 200: ${streamRetryResponse.status}`,
+    );
+    assert(streamRetryResponse.text.includes("[DONE]"), "流式内部重试未返回第二次正常 SSE");
+    assert(!streamRetryResponse.text.includes("reasoning_guard_triggered"), "流式内部重试不应暴露首次拦截体");
+    assert(
+      upstream.responseRequests.filter((entry) => entry.body?.test_sequence_key === streamRetryKey).length === 2,
+      "流式命中后内部重试应向上游请求 2 次",
+    );
+    const streamRetryLogs = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/logs`,
+    ).then((response) => response.json());
+    assert(
+      streamRetryLogs.entries.some((entry) =>
+        `${entry.message || ""}`.includes(
+          "[match] stream path=/responses reasoning_tokens=516 action=internal_retry remaining=1",
+        ),
+      ),
+      "流式内部重试日志应标记为 internal_retry",
+    );
+    const statusAfterStreamGuardRetry = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    assert(
+      statusAfterStreamGuardRetry.metrics.total_proxy_request_count ===
+        statusBeforeStreamGuardRetry.metrics.total_proxy_request_count + 2,
+      "流式内部重试应按每次上游尝试计入代理请求总数",
+    );
+    assert(
+      statusAfterStreamGuardRetry.metrics.inspected_response_count ===
+        statusBeforeStreamGuardRetry.metrics.inspected_response_count + 2,
+      "流式内部重试应按每次响应计入被检查响应总数",
+    );
+    assert(
+      statusAfterStreamGuardRetry.metrics.matched_response_count ===
+        statusBeforeStreamGuardRetry.metrics.matched_response_count + 1,
+      "流式内部重试首次命中应计入当前规则命中总数",
+    );
+    assert(
+      statusAfterStreamGuardRetry.metrics.blocked_response_count ===
+        statusBeforeStreamGuardRetry.metrics.blocked_response_count + 1,
+      "流式内部重试首次吞掉响应应计入实际拦截总数",
+    );
+
+    const restoreDefaultGuardRetryConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          guard_retry_attempts: 3,
+        }),
+      },
+    );
+    assert(
+      restoreDefaultGuardRetryConfigResponse.status === 200,
+      `恢复 guard_retry_attempts=3 失败: ${restoreDefaultGuardRetryConfigResponse.status}`,
+    );
 
     const recoveredResponse = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
       method: "POST",
@@ -2096,12 +2464,12 @@ async function run() {
     const familyBreakdown = statusWithModelInsights.model_insights.family_breakdown;
     assert(familyBreakdown, "status 缺少 family_breakdown");
     assert(
-      familyBreakdown["gpt-5.4"]?.consistency?.total_checked === 6,
-      "gpt-5.4 家族 total_checked 统计不正确",
+      familyBreakdown["gpt-5.4"]?.consistency?.total_checked === 11,
+      `gpt-5.4 家族 total_checked 统计不正确: ${familyBreakdown["gpt-5.4"]?.consistency?.total_checked}`,
     );
     assert(
-      familyBreakdown["gpt-5.4"]?.consistency?.matched === 4,
-      "gpt-5.4 家族 matched 统计不正确",
+      familyBreakdown["gpt-5.4"]?.consistency?.matched === 9,
+      `gpt-5.4 家族 matched 统计不正确: ${familyBreakdown["gpt-5.4"]?.consistency?.matched}`,
     );
     assert(
       familyBreakdown["gpt-5.4"]?.consistency?.mismatched === 1,
@@ -2112,7 +2480,7 @@ async function run() {
       "gpt-5.4 家族 unknown 统计不正确",
     );
     assert(
-      Math.abs(familyBreakdown["gpt-5.4"]?.consistency?.match_ratio - 4 / 5) < 1e-9,
+      Math.abs(familyBreakdown["gpt-5.4"]?.consistency?.match_ratio - 9 / 10) < 1e-9,
       "gpt-5.4 家族声明一致率应排除 unknown",
     );
     assert(

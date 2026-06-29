@@ -8,6 +8,7 @@
   "intercept_streaming": true,
   "intercept_non_streaming": true,
   "non_stream_status_code": 502,
+  "guard_retry_attempts": 3,
   "stream_action": "strict_502",
   "log_match": true,
   "health_path": "/__codex_retry_gateway/health",

@@ -188,6 +188,17 @@ export function normalizeStringArray(values, fallback = []) {
   return normalized.length > 0 ? [...new Set(normalized)] : [...fallback];
 }
 
+function normalizeGuardRetryAttempts(value, fallback = 3) {
+  if (value === undefined || value === null || `${value}`.trim() === "") {
+    return fallback;
+  }
+  const text = `${value}`.trim();
+  const parsed = Number.parseInt(text, 10);
+  return Number.isInteger(parsed) && parsed >= 0 && String(parsed) === text
+    ? parsed
+    : fallback;
+}
+
 export function isProcessAlive(processId) {
   try {
     process.kill(processId, 0);
@@ -424,6 +435,7 @@ export async function installForCurrentProvider({
       existingGatewayConfig?.non_stream_status_code === undefined || existingGatewayConfig?.non_stream_status_code === null
         ? 502
         : Number.parseInt(`${existingGatewayConfig.non_stream_status_code}`, 10),
+    guard_retry_attempts: normalizeGuardRetryAttempts(existingGatewayConfig?.guard_retry_attempts, 3),
     stream_action: existingGatewayConfig?.stream_action || "strict_502",
     log_match: existingGatewayConfig?.log_match === undefined ? true : Boolean(existingGatewayConfig.log_match),
     health_path: existingGatewayConfig?.health_path || DEFAULT_HEALTH_PATH,
@@ -571,6 +583,9 @@ export async function launchUi({
       }
       if (existingGatewayConfig.intercept_non_streaming === undefined) {
         existingGatewayConfig.intercept_non_streaming = true;
+      }
+      if (existingGatewayConfig.guard_retry_attempts === undefined || existingGatewayConfig.guard_retry_attempts === null) {
+        existingGatewayConfig.guard_retry_attempts = 3;
       }
       if (!existingGatewayConfig.intercept_streaming && !existingGatewayConfig.intercept_non_streaming) {
         existingGatewayConfig.intercept_streaming = true;

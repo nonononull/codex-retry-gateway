@@ -106,11 +106,16 @@ async function run() {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "codex-retry-gateway-install-"));
   const codexDir = path.join(tempRoot, ".codex");
   const stateRoot = path.join(tempRoot, ".codex-retry-gateway");
+  const legacyStateRoot = path.join(tempRoot, ".codex-retry-gateway-legacy");
+  const legacyCodexDir = path.join(tempRoot, ".codex-legacy");
+  const legacyCodexConfigPath = path.join(legacyCodexDir, "config.toml");
+  const legacyGatewayPort = await getFreePort();
   const codexConfigPath = path.join(codexDir, "config.toml");
   const upstreamPort = await getFreePort();
   const gatewayPort = await getFreePort();
 
   await mkdir(codexDir, { recursive: true });
+  await mkdir(legacyCodexDir, { recursive: true });
   await writeFile(
     codexConfigPath,
     [
@@ -118,6 +123,19 @@ async function run() {
       "",
       "[model_providers.custom]",
       'name = "Install Test"',
+      `base_url = "http://127.0.0.1:${upstreamPort}"`,
+      'wire_api = "responses"',
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await writeFile(
+    legacyCodexConfigPath,
+    [
+      'model_provider = "custom"',
+      "",
+      "[model_providers.custom]",
+      'name = "Legacy Install Test"',
       `base_url = "http://127.0.0.1:${upstreamPort}"`,
       'wire_api = "responses"',
       "",
@@ -159,8 +177,52 @@ async function run() {
       gatewayConfig.intercept_non_streaming === true,
       "Gateway config default intercept_non_streaming should be true",
     );
+    assert(gatewayConfig.guard_retry_attempts === 3, "Gateway config default guard_retry_attempts should be 3");
+    await mkdir(path.join(legacyStateRoot, "config"), { recursive: true });
+    const legacyGatewayConfig = {
+      ...gatewayConfig,
+      listen_port: legacyGatewayPort,
+    };
+    delete legacyGatewayConfig.intercept_streaming;
+    delete legacyGatewayConfig.intercept_non_streaming;
+    delete legacyGatewayConfig.guard_retry_attempts;
+    await writeFile(
+      path.join(legacyStateRoot, "config", "config.json"),
+      `${JSON.stringify(legacyGatewayConfig, null, 2)}\n`,
+      "utf8",
+    );
+    await runPowerShellScript(installScript, [
+      "-CodexConfigPath",
+      legacyCodexConfigPath,
+      "-StateRoot",
+      legacyStateRoot,
+      "-ListenPort",
+      String(legacyGatewayPort),
+    ]);
+    const reinstalledGatewayConfig = JSON.parse(
+      await readFile(path.join(legacyStateRoot, "config", "config.json"), "utf8"),
+    );
+    assert(
+      reinstalledGatewayConfig.intercept_streaming === true,
+      "Install script did not migrate missing intercept_streaming",
+    );
+    assert(
+      reinstalledGatewayConfig.intercept_non_streaming === true,
+      "Install script did not migrate missing intercept_non_streaming",
+    );
+    assert(
+      reinstalledGatewayConfig.guard_retry_attempts === 3,
+      "Install script did not migrate missing guard_retry_attempts",
+    );
+    await runPowerShellScript(restoreScript, [
+      "-CodexConfigPath",
+      legacyCodexConfigPath,
+      "-StateRoot",
+      legacyStateRoot,
+    ]);
     delete gatewayConfig.intercept_streaming;
     delete gatewayConfig.intercept_non_streaming;
+    delete gatewayConfig.guard_retry_attempts;
     await writeFile(
       path.join(stateRoot, "config", "config.json"),
       `${JSON.stringify(gatewayConfig, null, 2)}\n`,
@@ -185,6 +247,10 @@ async function run() {
     assert(
       migratedGatewayConfig.intercept_non_streaming === true,
       "Launch UI reuse did not migrate missing intercept_non_streaming",
+    );
+    assert(
+      migratedGatewayConfig.guard_retry_attempts === 3,
+      "Launch UI reuse did not migrate missing guard_retry_attempts",
     );
     assert(Array.isArray(gatewayConfig.endpoints), "Gateway config endpoints must be an array");
     assert(
@@ -215,6 +281,10 @@ async function run() {
     assert(uiHtml.includes("当前规则命中总数"), "Management UI HTML did not include current rule match stats");
     assert(uiHtml.includes("实际拦截总数"), "Management UI HTML did not include actual block total stats");
     assert(uiHtml.includes("实际拦截占比"), "Management UI HTML did not include actual block ratio stats");
+    assert(uiHtml.includes('id="guardRetryAttemptsInput"'), "Management UI HTML did not include guard retry input");
+    assert(uiHtml.includes("网关内重试次数"), "Management UI HTML did not include guard retry label");
+    assert(uiHtml.includes("TG群："), "Management UI HTML did not include Telegram group label");
+    assert(uiHtml.includes('href="https://t.me/AI_INPUT_IM"'), "Management UI HTML did not include Telegram group link");
     assert(uiHtml.includes("实时日志"), "Management UI HTML did not include live log panel");
     assert(uiHtml.includes("主动探针"), "Management UI HTML did not include active probe panel");
 
@@ -231,6 +301,7 @@ async function run() {
       statusPayload.config?.intercept_non_streaming === true,
       "Status API did not expose intercept_non_streaming default",
     );
+    assert(statusPayload.config?.guard_retry_attempts === 3, "Status API did not expose guard_retry_attempts default");
     assert(statusPayload.state?.original_base_url === `http://127.0.0.1:${upstreamPort}`, "Status API did not expose install state");
     assert(statusPayload.metrics?.inspected_response_count === 0, "Status API did not expose initial inspected count");
     assert(statusPayload.metrics?.reasoning_516_count === 0, "Status API did not expose initial 516 count");
@@ -244,6 +315,16 @@ async function run() {
       body: JSON.stringify({ test_reasoning_tokens: 128 }),
     });
     assert(normalResponse.status === 200, `Expected a passthrough response before 516 test: ${normalResponse.status}`);
+
+    const disableGuardRetryResponse = await fetch(`http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ guard_retry_attempts: 0 }),
+    });
+    assert(
+      disableGuardRetryResponse.status === 200,
+      `Disable guard retry API failed: ${disableGuardRetryResponse.status}`,
+    );
 
     const blocked516Response = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
       method: "POST",
@@ -290,6 +371,7 @@ async function run() {
         intercept_streaming: true,
         intercept_non_streaming: false,
         non_stream_status_code: 503,
+        guard_retry_attempts: 2,
         log_match: false,
         active_probe: {
           enabled: true,
@@ -301,6 +383,7 @@ async function run() {
     const saveConfigPayload = await saveConfigResponse.json();
     assert(saveConfigResponse.status === 200, `Save config API failed: ${saveConfigResponse.status}`);
     assert(saveConfigPayload.config?.non_stream_status_code === 503, "Save config API did not return updated config");
+    assert(saveConfigPayload.config?.guard_retry_attempts === 2, "Save config API did not return guard_retry_attempts");
     assert(saveConfigPayload.config?.intercept_streaming === true, "Save config API did not return intercept_streaming");
     assert(
       saveConfigPayload.config?.intercept_non_streaming === false,
@@ -319,6 +402,7 @@ async function run() {
       updatedGatewayConfig.intercept_non_streaming === false,
       "Saved config file did not persist intercept_non_streaming",
     );
+    assert(updatedGatewayConfig.guard_retry_attempts === 2, "Saved config file did not persist guard_retry_attempts");
     assert(
       updatedGatewayConfig.active_probe?.enabled === true,
       "Saved config file did not persist active_probe.enabled",

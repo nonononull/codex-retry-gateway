@@ -10,6 +10,26 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot "common.ps1")
 
+function Get-OptionalPropertyValue {
+  param(
+    $Object,
+    [Parameter(Mandatory = $true)]
+    [string]$Name,
+    $DefaultValue = $null
+  )
+
+  if ($null -eq $Object) {
+    return $DefaultValue
+  }
+
+  $property = $Object.PSObject.Properties[$Name]
+  if ($null -eq $property -or $null -eq $property.Value) {
+    return $DefaultValue
+  }
+
+  return $property.Value
+}
+
 $paths = Get-GatewayStatePaths -StateRoot $StateRoot
 Ensure-Directory -Path $paths.StateRoot
 Ensure-Directory -Path $paths.ConfigDir
@@ -58,15 +78,16 @@ $gatewayConfig = [ordered]@{
   listen_host = $ListenHost
   listen_port = $ListenPort
   upstream_base_url = $originalBaseUrl
-  request_body_limit_bytes = if ($existingGatewayConfig -and $null -ne $existingGatewayConfig.request_body_limit_bytes) { [int]$existingGatewayConfig.request_body_limit_bytes } else { 10485760 }
+  request_body_limit_bytes = [int](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "request_body_limit_bytes" -DefaultValue 10485760)
   endpoints = @($mergedEndpoints)
-  reasoning_equals = Normalize-IntArray -Values $(if ($existingGatewayConfig) { $existingGatewayConfig.reasoning_equals } else { $null }) -Default @(516, 1034, 1552)
-  intercept_streaming = if ($existingGatewayConfig -and $null -ne $existingGatewayConfig.intercept_streaming) { [bool]$existingGatewayConfig.intercept_streaming } else { $true }
-  intercept_non_streaming = if ($existingGatewayConfig -and $null -ne $existingGatewayConfig.intercept_non_streaming) { [bool]$existingGatewayConfig.intercept_non_streaming } else { $true }
-  non_stream_status_code = if ($existingGatewayConfig -and $null -ne $existingGatewayConfig.non_stream_status_code) { [int]$existingGatewayConfig.non_stream_status_code } else { 502 }
-  stream_action = if ($existingGatewayConfig -and -not [string]::IsNullOrWhiteSpace([string]$existingGatewayConfig.stream_action)) { [string]$existingGatewayConfig.stream_action } else { "strict_502" }
-  log_match = if ($existingGatewayConfig -and $null -ne $existingGatewayConfig.log_match) { [bool]$existingGatewayConfig.log_match } else { $true }
-  health_path = if ($existingGatewayConfig -and -not [string]::IsNullOrWhiteSpace([string]$existingGatewayConfig.health_path)) { [string]$existingGatewayConfig.health_path } else { "/__codex_retry_gateway/health" }
+  reasoning_equals = Normalize-IntArray -Values (Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "reasoning_equals") -Default @(516, 1034, 1552)
+  intercept_streaming = [bool](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "intercept_streaming" -DefaultValue $true)
+  intercept_non_streaming = [bool](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "intercept_non_streaming" -DefaultValue $true)
+  non_stream_status_code = [int](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "non_stream_status_code" -DefaultValue 502)
+  guard_retry_attempts = [int](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "guard_retry_attempts" -DefaultValue 3)
+  stream_action = if ([string]::IsNullOrWhiteSpace([string](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "stream_action"))) { "strict_502" } else { [string](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "stream_action") }
+  log_match = [bool](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "log_match" -DefaultValue $true)
+  health_path = if ([string]::IsNullOrWhiteSpace([string](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "health_path"))) { "/__codex_retry_gateway/health" } else { [string](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "health_path") }
 }
 
 $previousConfigContent = Get-Content -LiteralPath $CodexConfigPath -Raw
