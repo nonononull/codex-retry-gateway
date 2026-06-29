@@ -1,5 +1,95 @@
 # err.md
 
+## 2026-06-29 Issue #6：旧配置缺字段导致 PowerShell StrictMode 安装失败
+
+### 现象
+
+- 用户更新后执行：
+  - `powershell -ExecutionPolicy Bypass -File .\scripts\launch-ui.ps1`
+- 报错：
+  - `The property 'intercept_streaming' cannot be found on this object`
+  - 位置指向 `scripts\install-for-current-provider.ps1`
+
+### 根因
+
+- 旧版 `config.json` 没有 `intercept_streaming` / `intercept_non_streaming` / `guard_retry_attempts` 等新增字段
+- PowerShell 脚本启用了 `Set-StrictMode -Version Latest`
+- 在 StrictMode 下直接访问 `$existingGatewayConfig.intercept_streaming`，缺字段会抛异常，不能像普通 PowerShell 那样默认为 `$null`
+
+### 处理
+
+- `install-for-current-provider.ps1` 新增本地 helper：
+  - `Get-OptionalPropertyValue`
+- 所有可选旧配置字段统一通过 `PSObject.Properties[...]` 安全读取
+- 缺失字段回落默认值：
+  - `intercept_streaming = true`
+  - `intercept_non_streaming = true`
+  - `guard_retry_attempts = 3`
+  - 其他字段沿用既有默认
+- `scripts/test-install-restore.mjs` 增加旧配置缺字段后再次执行安装脚本的回归覆盖
+
+### 跨平台补充
+
+- 本轮专门重跑 Windows 和 Unix 入口测试
+- 发现当前 worktree 缺 `.gitattributes`，导致 `.sh` 入口再次变成 CRLF，Bash 报：
+  - `set: pipefail\r: invalid option name`
+- 新增 `.gitattributes`：
+  - `*.sh text eol=lf`
+- 将现有 `.sh` 入口统一转为 LF
+
+### 验证
+
+- `node .\scripts\test-install-restore.mjs` 通过
+- `node .\scripts\test-launch-ui.mjs` 通过
+- `node .\scripts\test-launch-ui-unix.mjs` 通过
+
+## 2026-06-29 命中拦截规则后不能继续把失败状态码暴露给 Codex
+
+### 现象
+
+- 规则拦截此前会向 Codex 返回本地 `502`
+- Codex 遇到失败状态后会自动 `Reconnecting...`
+- 连续重连达到上限后，会话可能断开
+- 实测 `409` 和 `422` 也会触发 Codex 自动重连，不能作为最终拦截收口状态码
+
+### 根因
+
+- 网关把“本地规则拦截”伪装成 HTTP 失败状态返回给 Codex
+- Codex 无法区分这是本地规则命中，还是上游真实故障
+- 早期为了快速上线依赖 Codex 自身重连，导致命中规则时有断会话风险
+
+### 处理
+
+- 新增 `guard_retry_attempts`
+  - 默认 `3`
+  - 必须是大于等于 `0` 的整数
+  - `0` 表示不做网关内部规则重试
+  - 无上限，管理页保存后立即生效
+- 仅当响应命中当前拦截规则且会被实际拦截时，网关内部重新请求上游
+- 上游真实 HTTP `429` / `502` 等错误如果没有命中规则，继续原样透传给 Codex
+- `fetch failed` 仍按既有上游连接失败逻辑处理，本轮不改变其语义
+- 内部重试统计沿用现有 UI 口径：
+  - 每次上游尝试计入代理请求总数
+  - 每次被检查的响应计入被检查响应总数
+  - 命中规则计入当前规则命中总数
+  - 被吞掉重试或最终拦截计入实际拦截总数
+- 命中日志动作：
+  - `action=internal_retry remaining=N`：本次命中被网关吞掉，并继续内部重试，没有暴露给 Codex
+  - `action=return_status_502`：重试次数为 `0` 或已达到上限，本次才真正向 Codex 返回拦截状态
+  - `action=observe_only`：当前类型命中但配置为只观察不拦截
+
+### 验证
+
+- `node .\scripts\test-gateway-e2e.mjs`：
+  - 覆盖非流式 `516 -> 128` 内部重试恢复为 `200`
+  - 覆盖流式 strict `516 -> 128` 内部重试恢复为正常 SSE
+  - 覆盖连续 `516 -> 516` 超过上限后才返回本地拦截状态
+  - 覆盖上游真实 `429` 不触发规则内部重试并原样透传
+- `node .\scripts\test-install-restore.mjs`：
+  - 覆盖新装默认 `guard_retry_attempts = 3`
+  - 覆盖旧配置迁移补默认值
+  - 覆盖保存配置持久化 `guard_retry_attempts`
+
 ## 2026-06-28 长上下文主动探针从词数近似升级为 token 预算硬探针
 
 ### 现象

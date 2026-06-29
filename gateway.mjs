@@ -28,6 +28,7 @@ const DEFAULT_CONFIG = {
   intercept_streaming: true,
   intercept_non_streaming: true,
   non_stream_status_code: 502,
+  guard_retry_attempts: 3,
   stream_action: "strict_502",
   log_match: true,
   health_path: "/__codex_retry_gateway/health",
@@ -646,6 +647,18 @@ function normalizeStringList(values, fallback = []) {
 function normalizePositiveInteger(value, fallback) {
   const parsed = Number.parseInt(`${value}`, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeGuardRetryAttempts(value) {
+  const text = `${value ?? ""}`.trim();
+  if (text === "") {
+    throw new Error("guard_retry_attempts 必须是大于等于 0 的整数");
+  }
+  const parsed = Number.parseInt(text, 10);
+  if (!Number.isInteger(parsed) || String(parsed) !== text || parsed < 0) {
+    throw new Error("guard_retry_attempts 必须是大于等于 0 的整数");
+  }
+  return parsed;
 }
 
 function normalizeTrackedFamilyList(values, fallback = []) {
@@ -1412,6 +1425,7 @@ async function loadConfig(configPath) {
   );
   config.intercept_streaming = config.intercept_streaming !== false;
   config.intercept_non_streaming = config.intercept_non_streaming !== false;
+  config.guard_retry_attempts = normalizeGuardRetryAttempts(config.guard_retry_attempts);
   if (!config.intercept_streaming && !config.intercept_non_streaming) {
     throw new Error("流式与非流式至少选择一个拦截目标");
   }
@@ -2556,6 +2570,10 @@ function buildEditableConfig(currentConfig, payload) {
     payload.intercept_non_streaming === undefined
       ? currentConfig.intercept_non_streaming !== false
       : Boolean(payload.intercept_non_streaming);
+  const nextGuardRetryAttempts =
+    payload.guard_retry_attempts === undefined
+      ? currentConfig.guard_retry_attempts
+      : normalizeGuardRetryAttempts(payload.guard_retry_attempts);
   const nextActiveProbe =
     payload.active_probe === undefined
       ? currentConfig.active_probe
@@ -2593,6 +2611,7 @@ function buildEditableConfig(currentConfig, payload) {
     intercept_streaming: nextInterceptStreaming,
     intercept_non_streaming: nextInterceptNonStreaming,
     non_stream_status_code: nextStatusCode,
+    guard_retry_attempts: nextGuardRetryAttempts,
     log_match: payload.log_match === undefined ? currentConfig.log_match : Boolean(payload.log_match),
     active_probe: nextActiveProbe,
   };
@@ -2668,10 +2687,38 @@ function buildManagementHtml() {
         font-weight: 700;
       }
 
-      h1 {
+      .hero-heading {
+        display: flex;
+        align-items: center;
+        gap: 28px;
+        flex-wrap: wrap;
         margin: 16px 0 8px;
+      }
+
+      h1 {
+        margin: 0;
         font-size: clamp(30px, 6vw, 48px);
         line-height: 1.05;
+      }
+
+      .tg-link {
+        display: inline-flex;
+        align-items: center;
+        min-height: 34px;
+        padding: 7px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.62);
+        color: var(--accent);
+        font-size: 14px;
+        font-weight: 700;
+        text-decoration: none;
+        word-break: break-word;
+      }
+
+      .tg-link:hover {
+        border-color: rgba(31, 111, 95, 0.42);
+        background: var(--accent-soft);
       }
 
       .lead {
@@ -3071,7 +3118,10 @@ function buildManagementHtml() {
     <div class="shell">
       <section class="hero">
         <div class="eyebrow">本地管理页</div>
-        <h1>Codex Retry Gateway</h1>
+        <div class="hero-heading">
+          <h1>Codex Retry Gateway</h1>
+          <a class="tg-link" href="https://t.me/AI_INPUT_IM" target="_blank" rel="noopener noreferrer">TG群：https://t.me/AI_INPUT_IM</a>
+        </div>
         <p class="lead">
           这个页面直接挂在正在运行的 gateway 上。你可以在这里查看当前接管状态、修改 reasoning 拦截条件，并一键恢复 Codex 原设置。
         </p>
@@ -3137,6 +3187,12 @@ function buildManagementHtml() {
               <div class="field">
                 <label for="statusCodeInput">non_stream_status_code</label>
                 <input id="statusCodeInput" name="non_stream_status_code" type="number" min="100" max="599" />
+              </div>
+
+              <div class="field">
+                <label for="guardRetryAttemptsInput">网关内重试次数</label>
+                <input id="guardRetryAttemptsInput" name="guard_retry_attempts" type="number" min="0" step="1" required />
+                <div class="hint">仅对命中拦截规则的响应生效；上游 429/502 等真实错误会直接透传。</div>
               </div>
 
               <div class="inline-toggle">
@@ -3298,6 +3354,7 @@ function buildManagementHtml() {
         interceptModeValue: document.getElementById('interceptModeValue'),
         endpointsInput: document.getElementById('endpointsInput'),
         statusCodeInput: document.getElementById('statusCodeInput'),
+        guardRetryAttemptsInput: document.getElementById('guardRetryAttemptsInput'),
         logMatchInput: document.getElementById('logMatchInput'),
         probeTargetFamily54Input: document.getElementById('probeTargetFamily54Input'),
         probeTargetFamily55Input: document.getElementById('probeTargetFamily55Input'),
@@ -3585,6 +3642,7 @@ function buildManagementHtml() {
         syncInterceptModeValueFromForm();
         refs.endpointsInput.value = Array.isArray(config?.endpoints) ? config.endpoints.join('\\n') : '';
         refs.statusCodeInput.value = config?.non_stream_status_code ?? 502;
+        refs.guardRetryAttemptsInput.value = String(config?.guard_retry_attempts ?? 3);
         refs.logMatchInput.checked = Boolean(config?.log_match);
         const activeProbe = config?.active_probe || {};
         const targetFamilies = Array.isArray(activeProbe?.target_families) ? activeProbe.target_families : [];
@@ -3872,6 +3930,7 @@ function buildManagementHtml() {
               endpoints: parseEndpointsInput(),
               ...interceptPayload,
               non_stream_status_code: Number.parseInt(refs.statusCodeInput.value, 10),
+              guard_retry_attempts: Number.parseInt(refs.guardRetryAttemptsInput.value, 10),
               log_match: refs.logMatchInput.checked,
               active_probe: collectActiveProbeFormPayload(),
             }),
@@ -4433,28 +4492,36 @@ async function handleNonStreaming({
   setRequestTrackingOutcome(requestTracking, "inspected");
 
   if (matched) {
+    const shouldIntercept = config.intercept_non_streaming !== false;
+    const canGuardRetry = shouldIntercept && requestTracking?.guardRetryRemaining > 0;
     if (config.log_match) {
+      const action = !shouldIntercept
+        ? "observe_only"
+        : canGuardRetry
+          ? `internal_retry remaining=${requestTracking.guardRetryRemaining}`
+          : `return_status_${config.non_stream_status_code}`;
       logger(
-        `[match] non-stream path=${pathname} reasoning_tokens=${reasoning} action=${
-          config.intercept_non_streaming === false ? "observe_only" : `status_${config.non_stream_status_code}`
-        }`,
+        `[match] non-stream path=${pathname} reasoning_tokens=${reasoning} action=${action}`,
       );
     }
-    if (config.intercept_non_streaming !== false) {
+    if (shouldIntercept) {
       recordBlockedResponse(monitor, "non-stream");
-      const blockedBody = buildBlockedBody(pathname, reasoning, config.non_stream_status_code);
-      res.writeHead(config.non_stream_status_code, {
-        "content-type": "application/json; charset=utf-8",
-        "x-codex-retry-gateway-reason": "reasoning-guard-triggered",
-      });
-      res.end(blockedBody);
       finalizeModelInsights(
         monitor,
         pathname,
         modelContext,
         upstreamResponse.status >= 400 ? parsed : null,
       );
-      return;
+      if (canGuardRetry) {
+        return { guardRetry: true };
+      }
+      const blockedBody = buildBlockedBody(pathname, reasoning, config.non_stream_status_code);
+      res.writeHead(config.non_stream_status_code, {
+        "content-type": "application/json; charset=utf-8",
+        "x-codex-retry-gateway-reason": "reasoning-guard-triggered",
+      });
+      res.end(blockedBody);
+      return { handled: true };
     }
   }
 
@@ -4467,6 +4534,7 @@ async function handleNonStreaming({
   copyHeadersToClient(upstreamResponse.headers, res);
   res.writeHead(upstreamResponse.status);
   res.end(bodyBuffer);
+  return { handled: true };
 }
 
 async function handleStreaming({
@@ -4556,15 +4624,23 @@ async function handleStreaming({
         inspectedRecorded = true;
       }
       setRequestTrackingOutcome(requestTracking, "inspected");
+      const shouldIntercept = config.intercept_streaming !== false;
+      const canGuardRetry =
+        shouldIntercept && (strict502Mode || !wroteAnyChunk) && requestTracking?.guardRetryRemaining > 0;
       if (config.log_match) {
+        const action = !shouldIntercept
+          ? "observe_only"
+          : canGuardRetry
+            ? `internal_retry remaining=${requestTracking.guardRetryRemaining}`
+            : strict502Mode || !wroteAnyChunk
+              ? `return_status_${config.non_stream_status_code}`
+              : "disconnect";
         logger(
-          `[match] stream path=${pathname} reasoning_tokens=${reasoning} action=${
-            config.intercept_streaming === false ? "observe_only" : config.stream_action
-          }`,
+          `[match] stream path=${pathname} reasoning_tokens=${reasoning} action=${action}`,
         );
       }
 
-      if (config.intercept_streaming === false) {
+      if (!shouldIntercept) {
         if (strict502Mode) {
           bufferedChunks.push(chunkBuffer);
         } else {
@@ -4578,20 +4654,23 @@ async function handleStreaming({
       if (strict502Mode || !wroteAnyChunk) {
         abortController.abort();
         reader.cancel().catch(() => {});
+        finalizeModelInsights(monitor, pathname, modelContext);
+        if (canGuardRetry) {
+          return { guardRetry: true };
+        }
         const blockedBody = buildBlockedBody(pathname, reasoning, config.non_stream_status_code);
         res.writeHead(config.non_stream_status_code, {
           "content-type": "application/json; charset=utf-8",
           "x-codex-retry-gateway-reason": "reasoning-guard-triggered",
         });
         res.end(blockedBody);
-        finalizeModelInsights(monitor, pathname, modelContext);
       } else {
         abortController.abort();
         reader.cancel().catch(() => {});
         res.socket?.destroy();
         finalizeModelInsights(monitor, pathname, modelContext);
       }
-      return;
+      return { handled: true };
     }
 
     if (strict502Mode) {
@@ -4631,86 +4710,96 @@ async function proxyRequest(runtime, req, res) {
   }
 
   req.__codexRetryGatewayProxyTracked = true;
-  runtime.monitor.total_proxy_request_count += 1;
-  recordActiveProxyRequestStart(runtime.monitor, pathname);
 
-  try {
-    const requestBody = await readRequestBody(req, config.request_body_limit_bytes);
-    const requestJson = isJsonContentType(req.headers["content-type"])
-      ? parseJsonSafely(requestBody)
-      : null;
-    runtime.lastClientUserAgent =
-      typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"].trim() : "";
-    buildActiveProbeRequestProfile(runtime, requestJson);
-    const localConfigModel = await getLocalConfigModel(runtime);
-    const modelContext = createRequestModelContext(localConfigModel, requestJson?.model ?? null);
-    const requestIsStream = Boolean(requestJson?.stream);
+  const requestBody = await readRequestBody(req, config.request_body_limit_bytes);
+  const requestJson = isJsonContentType(req.headers["content-type"])
+    ? parseJsonSafely(requestBody)
+    : null;
+  runtime.lastClientUserAgent =
+    typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"].trim() : "";
+  buildActiveProbeRequestProfile(runtime, requestJson);
+  const localConfigModel = await getLocalConfigModel(runtime);
+  const requestIsStream = Boolean(requestJson?.stream);
+  const upstreamUrl = buildUpstreamUrl(config.upstream_base_url, incomingUrl);
+  const shouldInspect = matchPath(config, pathname);
+  let guardRetryAttemptsUsed = 0;
 
-    const upstreamUrl = buildUpstreamUrl(config.upstream_base_url, incomingUrl);
+  while (true) {
+    runtime.monitor.total_proxy_request_count += 1;
+    recordActiveProxyRequestStart(runtime.monitor, pathname);
     const abortController = new AbortController();
+    const modelContext = createRequestModelContext(localConfigModel, requestJson?.model ?? null);
+    requestTracking.guardRetryRemaining = Math.max(
+      0,
+      Number(config.guard_retry_attempts || 0) - guardRetryAttemptsUsed,
+    );
 
-    const upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, {
-      method: req.method,
-      headers: cloneHeadersForUpstream(req.headers),
-      body: requestBody.length > 0 ? requestBody : undefined,
-      signal: abortController.signal,
-    }, logger);
+    try {
+      const upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, {
+        method: req.method,
+        headers: cloneHeadersForUpstream(req.headers),
+        body: requestBody.length > 0 ? requestBody : undefined,
+        signal: abortController.signal,
+      }, logger);
 
-    const shouldInspect = matchPath(config, pathname);
-    const responseIsStream =
-      requestIsStream || isSseContentType(upstreamResponse.headers.get("content-type"));
+      const responseIsStream =
+        requestIsStream || isSseContentType(upstreamResponse.headers.get("content-type"));
 
-    if (!shouldInspect) {
-      const body = Buffer.from(await upstreamResponse.arrayBuffer());
-      if (isJsonContentType(upstreamResponse.headers.get("content-type"))) {
-        const parsed = parseJsonSafely(body);
-        if (parsed) {
-          applyPayloadModelSignals(modelContext, parsed, { fromFinalResponse: true });
+      if (!shouldInspect) {
+        const body = Buffer.from(await upstreamResponse.arrayBuffer());
+        if (isJsonContentType(upstreamResponse.headers.get("content-type"))) {
+          const parsed = parseJsonSafely(body);
+          if (parsed) {
+            applyPayloadModelSignals(modelContext, parsed, { fromFinalResponse: true });
+          }
         }
+        finalizeModelInsights(
+          runtime.monitor,
+          pathname,
+          modelContext,
+          upstreamResponse.status >= 400 && isJsonContentType(upstreamResponse.headers.get("content-type"))
+            ? parseJsonSafely(body)
+            : null,
+        );
+        copyHeadersToClient(upstreamResponse.headers, res);
+        res.writeHead(upstreamResponse.status);
+        res.end(body);
+        recordBypassedProxyRequest(runtime.monitor, pathname);
+        setRequestTrackingOutcome(requestTracking, "bypassed");
+        return;
       }
-      finalizeModelInsights(
-        runtime.monitor,
-        pathname,
-        modelContext,
-        upstreamResponse.status >= 400 && isJsonContentType(upstreamResponse.headers.get("content-type"))
-          ? parseJsonSafely(body)
-          : null,
-      );
-      copyHeadersToClient(upstreamResponse.headers, res);
-      res.writeHead(upstreamResponse.status);
-      res.end(body);
-      recordBypassedProxyRequest(runtime.monitor, pathname);
-      setRequestTrackingOutcome(requestTracking, "bypassed");
-      return;
-    }
 
-    if (responseIsStream) {
-      await handleStreaming({
-        config,
-        logger,
-        monitor: runtime.monitor,
-        pathname,
-        requestTracking,
-        modelContext,
-        upstreamResponse,
-        res,
-        abortController,
-      });
-      return;
-    }
+      const handlerResult = responseIsStream
+        ? await handleStreaming({
+            config,
+            logger,
+            monitor: runtime.monitor,
+            pathname,
+            requestTracking,
+            modelContext,
+            upstreamResponse,
+            res,
+            abortController,
+          })
+        : await handleNonStreaming({
+            config,
+            logger,
+            monitor: runtime.monitor,
+            pathname,
+            requestTracking,
+            modelContext,
+            upstreamResponse,
+            res,
+          });
 
-    await handleNonStreaming({
-      config,
-      logger,
-      monitor: runtime.monitor,
-      pathname,
-      requestTracking,
-      modelContext,
-      upstreamResponse,
-      res,
-    });
-  } finally {
-    recordActiveProxyRequestEnd(runtime.monitor, pathname);
+      if (handlerResult?.guardRetry && guardRetryAttemptsUsed < Number(config.guard_retry_attempts || 0)) {
+        guardRetryAttemptsUsed += 1;
+        continue;
+      }
+      return;
+    } finally {
+      recordActiveProxyRequestEnd(runtime.monitor, pathname);
+    }
   }
 }
 

@@ -80,11 +80,18 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 
 页面支持：
 
+- 打开 TG 群入口：`https://t.me/AI_INPUT_IM`
 - 查看当前接管状态
 - 查看本次启动以来的实时日志
-- 查看 `516` 命中次数与 `516` 占比
-- 热更新 `reasoning_equals` / `endpoints` / `non_stream_status_code` / `log_match`
+- 查看当前规则命中总数、实际拦截总数与实际拦截占比
+- 热更新 `reasoning_equals` / `endpoints` / `non_stream_status_code` / `guard_retry_attempts` / `log_match`
 - 一键恢复 Codex 原设置并关闭 gateway
+
+并发与日志说明：
+
+- gateway 是本机 Node.js 单进程异步代理，适合 Codex 本地路由和少量并发请求。
+- 日志在同一进程内通过单个 `WriteStream` 追加写入；当前模型下不会多进程抢写同一个日志文件。
+- 严格流式拦截会缓存 SSE，请求体也会先读入内存；高并发或大响应场景需要额外压测、日志轮转和内存上限治理。
 
 ## 本地验证
 

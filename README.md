@@ -1,6 +1,6 @@
 # Codex Retry Gateway
 
-TG群：  https://t.me/AI_INPUT_IM
+TG群：[https://t.me/AI_INPUT_IM](https://t.me/AI_INPUT_IM)
 
 一个不依赖 `cc-switch` 路由模式的独立本地网关。
 
@@ -13,8 +13,8 @@ TG群：  https://t.me/AI_INPUT_IM
 
 - 保持 Codex 继续使用现有 `auth.json`
 - 只把 `config.toml` 的当前 provider `base_url` 改成本地网关
-- 非流式命中默认集合 `reasoning_tokens = 516 / 1034 / 1552` 时返回 `502`
-- 流式命中时默认先缓存并判断；一旦命中默认集合 `516 / 1034 / 1552`，统一返回 `502`
+- 非流式命中默认集合 `reasoning_tokens = 516 / 1034 / 1552` 时，默认先在网关内部重试，超过上限后才返回 `502`
+- 流式命中时默认先缓存并判断；一旦命中默认集合 `516 / 1034 / 1552`，默认先在网关内部重试，超过上限后才统一返回 `502`
 - 默认同时拦截 root 路径和 `/v1` 路径：
   - `/responses`
   - `/chat/completions`
@@ -25,6 +25,7 @@ TG群：  https://t.me/AI_INPUT_IM
 
 - 这个网关不负责 `Responses` 和 `Chat Completions` 协议互转
 - 如果你的上游本身不支持 Codex 当前使用的协议，这个网关不会替你补齐转换能力
+- 这个网关是本机单进程代理，适合 Codex 本地路由与少量并发请求，不定位为公网高并发反向代理
 
 ## 默认路径
 
@@ -158,6 +159,7 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 
 页面里可以直接做这几件事：
 
+- 打开顶部 `TG群：https://t.me/AI_INPUT_IM` 入口
 - 看当前监听地址、真实上游、当前 provider、当前 Codex base URL
 - 看本次 gateway 启动以来的实时统计
   - 代理请求总数
@@ -186,6 +188,7 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 - 改流式 / 非流式拦截目标
 - 改 `endpoints`
 - 改 `non_stream_status_code`
+- 改 `guard_retry_attempts`
 - 开关 `log_match`
 - 动态查看当前 gateway 的实时日志
 - 一键恢复 Codex 原设置
@@ -200,6 +203,9 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 - 当前规则命中总数表示命中 `reasoning_equals` 的次数，不等于实际拦截次数
 - 实际拦截占比 = 实际拦截总数 / 被检查响应总数
 - 关闭某一类拦截后，该类命中仍会继续计入规则命中与模型一致性观测，但不会计入实际拦截
+- `guard_retry_attempts` 只对命中当前拦截规则且会被实际拦截的响应生效；上游真实 `429` / `502` 等 HTTP 错误如果没有命中规则，会继续原样透传
+- 网关内部规则重试的每次上游尝试都会计入代理请求总数；每次拿到并检查的响应都会计入被检查响应总数；命中会计入当前规则命中总数，被吞掉重试或最终拦截会计入实际拦截总数
+- 命中日志里的 `action=internal_retry remaining=N` 表示本次命中只在网关内部吞掉并继续重试，没有把失败状态返回给 Codex；`action=return_status_502` 才表示已经达到重试上限或配置为 `0`，本次会对 Codex 返回拦截状态
 - 模型家族一致性面板里的“上游模型”是上游自报
 - “声明一致”不等于已证明真实运行一致
 - “400K 家族异常”只表示行为上疑似不符合 `1M` 家族
@@ -234,6 +240,11 @@ macOS / Linux: ~/.codex-retry-gateway/config/config.json
   - 默认包含 root 与 `/v1` 两套路径
 - `non_stream_status_code`
   - 默认 `502`
+- `guard_retry_attempts`
+  - 默认 `3`
+  - 命中当前拦截规则后，网关内部额外重试上游的次数
+  - `0` 表示不做网关内部规则重试
+  - 无上限，管理页保存后立即生效
 - `stream_action`
   - 默认 `strict_502`
   - `strict_502`：先缓存整个流，命中 `reasoning_equals` 里的值时统一返回 `502`
@@ -267,6 +278,22 @@ bash ./scripts/start-gateway.sh --restart-if-running
 ```
 
 如果你已经打开管理页，优先直接在页面里改，通常不需要手改 `config.json`。
+
+## 并发与日志写入
+
+当前 gateway 是 Node.js 单进程异步 HTTP 代理：
+
+- 可以同时处理多个 Codex 请求；每个请求都会独立读取请求体、请求上游、检查响应并更新统计。
+- `guard_retry_attempts` 的内部重试是按单个客户端请求独立计算的，不会和其他并发请求共享重试次数。
+- 日志写入使用同一个进程内 `WriteStream` 追加到日志文件；在当前单进程模型下，日志写入会按事件循环顺序排队，不会出现多进程同时抢写同一个日志文件的问题。
+- UI 实时日志来自内存里的 `log_entries`，文件日志和 UI 日志都会记录同一类事件。
+
+需要注意：
+
+- 严格流式拦截模式会先缓存上游 SSE，再决定透传、内部重试或返回 `502`；并发流式请求多、响应很大时，内存占用会增加。
+- 请求体会按 `request_body_limit_bytes` 先读入内存，默认限制是 `10MB`。
+- 当前 `log_entries` 是本次启动以来的内存累计；长时间高频运行会增加内存占用。
+- 如果要把它放到公网或很高 QPS 场景，建议前面加成熟反向代理，并补日志轮转、内存日志上限、压测和进程守护。
 
 ## 其他机器如何应用
 
