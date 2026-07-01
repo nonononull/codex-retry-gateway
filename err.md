@@ -1,5 +1,39 @@
 # err.md
 
+## 2026-07-02 reasoning 分桶表不应把 count=1 的 token 显示成“高频 token”
+
+### 现象
+
+- reasoning 行为统计里的三张分桶表：
+  - 按模型家族
+  - 按思考等级
+  - 模型家族 × 思考等级
+- 右侧原“高频 token”列会显示类似：
+  - `0 x4, 516 x2, 8 x1`
+- 当分桶样本较多且 reasoning token 分散时，`x1` 这类低频值被展示成“高频 token”，用户会误以为该列是完整、可靠的高频分布。
+
+### 根因
+
+- 后端 `summarizeGroupedSamples()` 固定取分桶内 `topReasoningTokensForSamples(samples, 3)`。
+- 该逻辑只是 Top 3 摘要，不等于真正高频。
+- 前端 `formatReasoningTokens()` 也没有过滤 `count=1`，导致低频 token 被画进“高频 token”列。
+
+### 处理
+
+- 分桶表改为展示“重复 token”：
+  - 后端只返回分桶内出现次数大于 `1` 的 reasoning token。
+  - 前端再次过滤 `count<=1`，兼容旧数据或旧缓存。
+  - 没有重复 token 时显示 `无重复 token`。
+- 全局“高频 token 排行”不变，因为它是独立的全局排行榜。
+
+### 验证
+
+- 红测：
+  - `node .\scripts\test-gateway-e2e.mjs`
+  - 先失败在 `reasoning 模型家族聚合表不应把 count=1 的低频 token 显示为高频 token`
+- 修复后：
+  - `node .\scripts\test-gateway-e2e.mjs`
+
 ## 2026-07-02 Issue #11：上游 Selected model is at capacity 应在网关内重试
 
 ### 现象

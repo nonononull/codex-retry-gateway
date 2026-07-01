@@ -1670,6 +1670,12 @@ function topReasoningTokensForSamples(samples, limit = 5) {
     }));
 }
 
+function repeatedReasoningTokensForSamples(samples, limit = 3) {
+  return topReasoningTokensForSamples(samples, samples.length)
+    .filter((entry) => entry.count > 1)
+    .slice(0, limit);
+}
+
 function buildOutputTpsBuckets(samples) {
   const buckets = [
     { label: "0-5", min: 0, max: 5, count: 0 },
@@ -1721,7 +1727,7 @@ function summarizeGroupedSamples(groupEntries, totalCount) {
         averageMetric(samples, (sample) => sample.reasoning_adjusted_tps) ?? 0,
         4,
       ),
-      top_reasoning_tokens: topReasoningTokensForSamples(samples, 3).map((entry) => ({
+      top_reasoning_tokens: repeatedReasoningTokensForSamples(samples, 3).map((entry) => ({
         value: entry.value,
         count: entry.count,
       })),
@@ -6623,7 +6629,7 @@ function buildManagementHtml() {
                     <th>commentary observed</th>
                     <th>平均耗时</th>
                     <th>平均 TPS</th>
-                    <th>高频 token</th>
+                    <th>重复 token</th>
                   </tr>
                 </thead>
                 <tbody id="reasoningByModelFamilyBody">
@@ -6643,7 +6649,7 @@ function buildManagementHtml() {
                     <th>commentary observed</th>
                     <th>平均耗时</th>
                     <th>归一化 TPS</th>
-                    <th>高频 token</th>
+                    <th>重复 token</th>
                   </tr>
                 </thead>
                 <tbody id="reasoningByEffortBody">
@@ -6663,7 +6669,7 @@ function buildManagementHtml() {
                     <th>commentary observed</th>
                     <th>平均耗时</th>
                     <th>平均 TPS</th>
-                    <th>高频 token</th>
+                    <th>重复 token</th>
                   </tr>
                 </thead>
                 <tbody id="reasoningByFamilyEffortBody">
@@ -7234,9 +7240,10 @@ function buildManagementHtml() {
       }
 
       function formatReasoningTokens(entries) {
-        const tokens = Array.isArray(entries) ? entries : [];
+        const tokens = (Array.isArray(entries) ? entries : [])
+          .filter((entry) => Number(entry?.count || 0) > 1);
         if (tokens.length === 0) {
-          return '-';
+          return '无重复 token';
         }
         return tokens
           .map((entry) => String(entry?.value ?? '-') + ' x' + String(entry?.count ?? 0))

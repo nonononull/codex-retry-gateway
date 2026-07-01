@@ -1658,12 +1658,27 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     "reasoning 模型家族聚合表未渲染 gpt-5.5 行",
   );
   assert(
+    elements.reasoningByModelFamilyBody.innerHTML.includes("516 x2") &&
+      !elements.reasoningByModelFamilyBody.innerHTML.includes("128 x1"),
+    "reasoning 模型家族聚合表不应把 count=1 的低频 token 显示为高频 token",
+  );
+  assert(
     elements.reasoningByEffortBody.innerHTML.includes("high"),
     "reasoning 思考等级聚合表未渲染 high 行",
   );
   assert(
+    elements.reasoningByEffortBody.innerHTML.includes("516 x2") &&
+      !elements.reasoningByEffortBody.innerHTML.includes("128 x1"),
+    "reasoning 思考等级聚合表不应把 count=1 的低频 token 显示为高频 token",
+  );
+  assert(
     elements.reasoningByFamilyEffortBody.innerHTML.includes("gpt-5.5 / high"),
     "reasoning 模型+思考等级聚合表未渲染组合行",
+  );
+  assert(
+    elements.reasoningByFamilyEffortBody.innerHTML.includes("516 x2") &&
+      !elements.reasoningByFamilyEffortBody.innerHTML.includes("128 x1"),
+    "reasoning 模型+思考等级聚合表不应把 count=1 的低频 token 显示为高频 token",
   );
   assert(
     elements.reasoningCandidatePatternsBody.innerHTML.includes("observe_only"),
