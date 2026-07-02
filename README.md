@@ -433,10 +433,10 @@ macOS / Linux: ~/.codex-retry-gateway
 
 ## 已验证事项
 
-- GitHub Actions `macos-smoke`
-  - 已新增 `macos-latest` 冒烟工作流
-  - 在 GitHub macOS runner 上直接执行 `node ./scripts/test-launch-ui-unix.mjs`
-  - 用来补足“本地没有 mac”时的 Unix 入口持续验证
+- 本地 CI 为默认验收入口
+  - 优先在本机运行 `test-gateway-e2e.ps1` / `test-install-restore.ps1` / `test-launch-ui.ps1` / `test-launch-ui-unix.ps1`
+  - GitHub Actions `macos-smoke` 已在仓库侧手动禁用，push / PR 不再自动运行
+  - 需要补足“本地没有 mac”时的 Unix 入口冒烟时，再按需手动重新启用或触发 `macos-smoke`
 - `test-gateway-e2e.ps1`
   - 已通过
   - 验证 `/responses`、`/chat/completions`、`/v1/responses`、`/v1/chat/completions`
